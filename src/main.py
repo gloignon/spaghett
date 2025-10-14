@@ -9,11 +9,13 @@ Variant of simple_surprisal_entropy_extra_context.py:
 
 CLI parameters:
     --input_file: Path to the input TSV file with documents or sentences.
+    --output_file: Path to the output TSV file (default: simple_output.tsv).
     --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
     --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
     --format: 'documents' or 'sentences' to specify input format.
     --left_context_file: Path to a .txt file whose contents are prepended (with a single space) to every sentence.
-    --top_k: Number of top tokens to export (default=5).
+    --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default=3).
+    --include_special_tokens: (AR only) Include special tokens (e.g., EOS) in AR outputs if present.
 
 Input TSV formats:
     Format 1 (documents): doc_id<TAB>text
@@ -21,7 +23,7 @@ Input TSV formats:
 
 Outputs:
     simple_output.tsv (TSV):
-        doc_id<TAB>sentence_id<TAB>token_index<TAB>token<TAB>surprisal_bits<TAB>entropy_bits<TAB>top_k_1...top_k_k
+        doc_id<TAB>sentence_id<TAB>token_index<TAB>token<TAB>surprisal_bits<TAB>entropy_bits<TAB>pred_top<TAB>pred_next_1...pred_next_N
 
 Notes:
     - CPU-only: no batching, no CUDA/GPU, no mixed precision; intended for clarity over speed.
