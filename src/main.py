@@ -2,455 +2,379 @@
 Simple script for computing per-token surprisal and entropy, by sentence, with extra left context,
 and exporting the top-k most probable next tokens for each scored token.
 
-Variant of simple_surprisal_entropy_extra_context.py:
-- Prepends a provided string (read from a .txt file) as extra left context to every sentence.
-- The left context only serves as context; NO surprisal or entropy is computed for it.
-- Adds --top_k (default 5) to output top_k_1..top_k_k columns with the highest-probability tokens.
-
 CLI parameters:
     --input_file: Path to the input TSV file with documents or sentences.
     --output_file: Path to the output TSV file (default: simple_output.tsv).
     --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
     --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
     --format: 'documents' or 'sentences' to specify input format.
-    --left_context_file: Path to a .txt file whose contents are prepended (with a single space) to every sentence.
-    --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default=3).
-    --include_special_tokens: (AR only) Include special tokens (e.g., EOS) in AR outputs if present.
+    --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
+    --top_k: Number of top probable tokens to output (default: 5).
+    --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default: 3).
+    --include_special_tokens: (AR only) Include special tokens in AR outputs if present.
 
 Input TSV formats:
-    Format 1 (documents): doc_id<TAB>text
-    Format 2 (sentences): doc_id<TAB>sentence_id<TAB>sentence
+    - documents: doc_id<TAB>text (with header)
+    - sentences: doc_id<TAB>sentence_id<TAB>sentence (with header)
 
-Outputs:
-    simple_output.tsv (TSV):
-        doc_id<TAB>sentence_id<TAB>token_index<TAB>token<TAB>surprisal_bits<TAB>entropy_bits<TAB>pred_top<TAB>pred_next_1...pred_next_N
-
-Notes:
-    - CPU-only: no batching, no CUDA/GPU, no mixed precision; intended for clarity over speed.
-    - "surprisal_bits" = -log2 p(token), entropy_bits from softmax distribution in bits.
-    - AR mode: uses logits at position i to score token at i+1. Special tokens are skipped (unless --include_special_tokens).
-    - MLM mode: masks one (sentence) token at a time; special tokens and left-context tokens are skipped.
-    - Also outputs the most probable next token (pred_top) and up to N greedy follow tokens (pred_next_1..pred_next_N) for AR, to complete a word.
+Outputs TSV with columns:
+    doc_id, sentence_id, token_index, token, surprisal_bits, entropy_bits, pred_top, top_k_1..top_k_N, pred_next_1..pred_next_N
 """
 
 import argparse
 import csv
 import math
 import re
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import torch
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    AutoModelForMaskedLM,
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 from tqdm import tqdm
 
 LN2 = math.log(2.0)
 
 
+# ============================================================================
+# Helper functions
+# ============================================================================
+
 def simple_sentence_split(text: str) -> List[str]:
-    """
-    Lightweight sentence splitter: splits on [.?!…] keeping delimiters.
-    """
-    if not text:
-        return []
-    t = re.sub(r"\.{3,}", "…", text)
-    parts = re.split(r"([\.?!…]+)", t)
-    sents, buf = [], ""
-    for chunk in parts:
-        if not chunk:
-            continue
-        buf += chunk
-        if re.fullmatch(r"[\.?!…]+", chunk):
-            sents.append(buf.strip())
-            buf = ""
-    if buf.strip():
-        sents.append(buf.strip())
-    return [s for s in sents if s]
+    """Split text into sentences using basic punctuation."""
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s for s in sentences if s]
 
 
-def _read_left_context(path: str) -> str:
-    """
-    Read left context from a text file. Collapses newlines to spaces and trims.
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        ctx = f.read()
-    ctx = ctx.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ").strip()
-    return ctx
+def read_left_context(path: str) -> str:
+    """Read left context from file, strip whitespace."""
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read().strip()
 
 
-def _combine_left_context(ctx: str, sentence: str) -> str:
-    """
-    Join left context and sentence with exactly one space (if both non-empty).
-    """
-    if not ctx:
-        return sentence
-    if not sentence:
-        return ctx
-    return f"{ctx} {sentence}"
+def combine_context_and_sentence(context: str, sentence: str) -> str:
+    """Combine left context with sentence, adding space if both non-empty."""
+    if context and sentence:
+        return f"{context} {sentence}"
+    return context or sentence
 
 
-def _find_subsequence(haystack: List[int], needle: List[int], start: int = 0) -> Optional[int]:
-    """
-    Return the start index of the first occurrence of needle in haystack at or after start, else None.
-    """
+def find_token_subsequence(haystack: List[int], needle: List[int], start: int = 0) -> int:
+    """Find first occurrence of needle in haystack starting at index. Returns -1 if not found."""
     if not needle:
-        return start
-    n, m = len(haystack), len(needle)
-    if m > n:
-        return None
-    for i in range(start, n - m + 1):
-        if haystack[i : i + m] == needle:
+        return -1
+    
+    for i in range(start, len(haystack) - len(needle) + 1):
+        if haystack[i:i + len(needle)] == needle:
             return i
-    return None
+    return -1
 
 
-def _safe_piece(s: str) -> str:
-    # Keep TSV stable
-    return s.replace("\t", " ").replace("\r", " ").replace("\n", "⏎")
+def get_context_boundary(token_ids: List[int], context_ids: List[int], special_mask: List[int]) -> int:
+    """Get last index of context tokens. Returns -1 if no context or not found."""
+    if not context_ids:
+        return -1
+    
+    # Find first non-special token
+    first_content = next((i for i, is_special in enumerate(special_mask) if not is_special), 0)
+    
+    # Find context subsequence
+    ctx_start = find_token_subsequence(token_ids, context_ids, start=first_content)
+    if ctx_start == -1:
+        return -1
+    
+    return ctx_start + len(context_ids) - 1
 
 
-def _ar_greedy_follow(tokenizer, model, prefix_ids: List[int], start_id: int, max_follow_n: int) -> List[str]:
-    """
-    Given a prefix and the top-1 next token id, greedily roll out up to max_follow_n
-    more tokens, stopping early if the next piece clearly starts a new word or is special/punctuation.
-    Returns decoded pieces (without the first/top piece).
-    """
-    follow: List[str] = []
-    if max_follow_n <= 0:
-        return follow
-
-    curr_ids = prefix_ids + [start_id]
-    for _ in range(max_follow_n):
-        with torch.no_grad():
-            out = model(torch.tensor([curr_ids], dtype=torch.long))
-            next_logits = out.logits[0, -1, :]
-        next_id = int(torch.argmax(next_logits).item())
-        piece = tokenizer.decode([next_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        s = _safe_piece(piece)
-
-        # If the next token begins a new word (leading space), is special, or is punctuation-only, stop.
-        if s[:1].isspace() or (hasattr(tokenizer, "all_special_ids") and next_id in tokenizer.all_special_ids) or re.fullmatch(r"^[\.\,\!\?\:\;\)\]\}\»\«\"\'…]+$", s or ""):
-            break
-
-        follow.append(s)
-        curr_ids.append(next_id)
-
-    return follow
+def bits_to_float(bits: float) -> float:
+    """Convert bits to natural log scale."""
+    return bits / LN2
 
 
-def score_autoregressive_with_context(
+# ============================================================================
+# Scoring functions
+# ============================================================================
+
+def score_autoregressive(
     sentence: str,
     left_context: str,
     tokenizer,
     model,
-    lookahead_n: int = 0,
-    include_special_tokens: bool = False,
+    top_k: int = 5,
+    lookahead_n: int = 3,
+    include_special: bool = False
 ) -> Tuple[List[str], List[float], List[float], List[List[str]]]:
     """
-    AR scoring with constant left context prepended. Only scores tokens belonging to the sentence.
-    Returns:
-        scored_tokens, surprisals_bits, entropies_bits, pred_cols_per_position
-        where pred_cols_per_position = [pred_top, pred_next_1, ..., pred_next_N]
+    Score sentence with AR model. Returns tokens, surprisals, entropies, and prediction columns.
+    Prediction columns include [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M].
     """
-    combined = _combine_left_context(left_context, sentence)
-
-    enc = tokenizer(
-        combined,
-        return_tensors="pt",
-        add_special_tokens=True,
-        padding=False,
-        truncation=False
-    )
-    input_ids = enc["input_ids"]          # [1, L]
-    if input_ids.size(1) < 1:
+    combined = combine_context_and_sentence(left_context, sentence)
+    encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
+    input_ids = encoding["input_ids"][0]
+    
+    if len(input_ids) < 2:
         return [], [], [], []
-
-    bos_id = getattr(tokenizer, "bos_token_id", None)
-    if bos_id is None:
-        bos_id = getattr(tokenizer, "eos_token_id", None)
-    if bos_id is None:
-        bos_id = getattr(tokenizer, "cls_token_id", None)
-    if bos_id is None:
-        raise ValueError("No BOS/EOS/CLS token available to anchor the first-token score.")
-
-    first_ids = input_ids[0].tolist()
-    special_mask_orig = tokenizer.get_special_tokens_mask(first_ids, already_has_special_tokens=True)
-    needs_bos = not bool(special_mask_orig[0])
-
-    if needs_bos:
-        input_ids = torch.cat([torch.tensor([[bos_id]], dtype=input_ids.dtype), input_ids], dim=1)
-
-    max_len = getattr(tokenizer, "model_max_length", None)
-    if max_len is not None and input_ids.size(1) > max_len:
-        raise ValueError(
-            f"Sequence length {input_ids.size(1)} exceeds model_max_length={max_len}. "
-            "Use shorter sentences or implement a sliding window."
-        )
-
-    ids_list = input_ids[0].tolist()
-    special_tokens_mask = torch.tensor(
-        tokenizer.get_special_tokens_mask(ids_list, already_has_special_tokens=True),
-        dtype=torch.bool
-    )
-
-    ctx_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"]
-    first_content_idx = 0
-    while first_content_idx < len(ids_list) and (first_content_idx < len(special_tokens_mask)) and bool(special_tokens_mask[first_content_idx].item()):
-        first_content_idx += 1
-    ctx_start = _find_subsequence(ids_list, ctx_ids, start=first_content_idx) if ctx_ids else None
-    if ctx_ids and ctx_start is None:
-        ctx_last = -1
-    else:
-        ctx_last = (ctx_start + len(ctx_ids) - 1) if ctx_ids else -1
-
+    
+    # Get context boundary
+    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
+    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    
+    # Get logits
     with torch.no_grad():
-        outputs = model(input_ids)
-        logits = outputs.logits  # [1, L, V]
-
-    surprisals_bits, entropies_bits, scored_tokens = [], [], []
-    pred_cols_per_pos: List[List[str]] = []
-
-    for i in range(len(ids_list) - 1):
-        j = i + 1
-        if j <= ctx_last:
+        logits = model(input_ids.unsqueeze(0)).logits[0]
+    
+    scored_tokens = []
+    surprisals = []
+    entropies = []
+    pred_columns = []
+    
+    for pos in range(len(input_ids) - 1):
+        target_pos = pos + 1
+        target_id = input_ids[target_pos].item()
+        
+        # Skip context and optionally special tokens
+        if target_pos <= ctx_last:
             continue
-        if bool(special_tokens_mask[j].item()) and not include_special_tokens:
+        if not include_special and special_mask[target_pos]:
             continue
-
-        next_token_logits = logits[0, i, :]
-        log_probs = torch.log_softmax(next_token_logits, dim=-1)
-        probs = torch.softmax(next_token_logits, dim=-1)
-
-        actual_token_id = input_ids[0, j].item()
-        token_log_prob = log_probs[actual_token_id].item()
-        surprisal_bits = -token_log_prob / LN2
-        entropy_nats = -(probs * log_probs).sum().item()
-        entropy_bits = entropy_nats / LN2
-
-        # Decode human-readable piece for the scored token (keep specials visible)
-        piece_true = tokenizer.decode([actual_token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        piece_true = _safe_piece(piece_true)
-
-        # Top-1 predicted next token for this position
-        top1_id = int(torch.argmax(next_token_logits).item())
-        pred_top = tokenizer.decode([top1_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        pred_top = _safe_piece(pred_top)
-
-        # Greedy follow to complete the word (up to lookahead_n)
-        prefix_ids = input_ids[0, :j].tolist()  # context up to position i (exclusive of true next token)
-        pred_follow = _ar_greedy_follow(tokenizer, model, prefix_ids, top1_id, max_follow_n=int(lookahead_n))
-        pred_cols = [pred_top] + pred_follow
-
-        scored_tokens.append(piece_true)
-        surprisals_bits.append(surprisal_bits)
-        entropies_bits.append(entropy_bits)
-        pred_cols_per_pos.append(pred_cols)
-
-    return scored_tokens, surprisals_bits, entropies_bits, pred_cols_per_pos
+        
+        # Compute probabilities
+        pos_logits = logits[pos]
+        probs = torch.softmax(pos_logits, dim=-1)
+        log_probs = torch.log_softmax(pos_logits, dim=-1)
+        
+        # Surprisal and entropy
+        surprisal = -log_probs[target_id].item() / LN2
+        entropy = -(probs * log_probs).sum().item() / LN2
+        
+        # Top-k predictions
+        top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
+        top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
+        
+        # Greedy lookahead
+        lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:target_pos + 1], n=lookahead_n)
+        
+        # Build prediction column: [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M]
+        pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
+        
+        scored_tokens.append(tokenizer.decode([target_id]))
+        surprisals.append(surprisal)
+        entropies.append(entropy)
+        pred_columns.append(pred_col)
+    
+    return scored_tokens, surprisals, entropies, pred_columns
 
 
-def score_masked_lm_with_context(
+def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List[str]:
+    """Generate n greedy next tokens from prefix."""
+    if n <= 0:
+        return []
+    
+    current = prefix_ids.clone()
+    lookahead = []
+    
+    for _ in range(n):
+        with torch.no_grad():
+            logits = model(current.unsqueeze(0)).logits[0, -1]
+        
+        next_id = logits.argmax().item()
+        lookahead.append(tokenizer.decode([next_id]))
+        current = torch.cat([current, torch.tensor([next_id])])
+    
+    return lookahead
+
+
+def score_masked_lm(
     sentence: str,
     left_context: str,
     tokenizer,
     model,
+    top_k: int = 5
 ) -> Tuple[List[str], List[float], List[float], List[List[str]]]:
     """
-    MLM scoring with constant left context. Only scores tokens belonging to the sentence (non-special).
-    Returns:
-        scored_tokens, surprisals_bits, entropies_bits, pred_cols_per_position
-        For MLM, pred_cols_per_position contains only [pred_top] at each position.
+    Score sentence with MLM. Returns tokens, surprisals, entropies, and prediction columns.
+    Prediction columns include [pred_top, top_k_1..top_k_N].
     """
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
-
-    combined = _combine_left_context(left_context, sentence)
+    
+    combined = combine_context_and_sentence(left_context, sentence)
     encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
     input_ids = encoding["input_ids"][0]
+    
     if len(input_ids) < 2:
         return [], [], [], []
-
-    special_tokens_mask = tokenizer.get_special_tokens_mask(
-        input_ids.tolist(), already_has_special_tokens=True
-    )
-
-    ids_list = input_ids.tolist()
-    ctx_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"]
-    first_content_idx = 0
-    while first_content_idx < len(ids_list) and special_tokens_mask[first_content_idx]:
-        first_content_idx += 1
-    ctx_start = _find_subsequence(ids_list, ctx_ids, start=first_content_idx) if ctx_ids else None
-    if ctx_ids and ctx_start is None:
-        ctx_last = -1
-    else:
-        ctx_last = (ctx_start + len(ctx_ids) - 1) if ctx_ids else -1
-
-    # tokens = tokenizer.convert_ids_to_tokens(input_ids)  # not used for output
-    surprisals_bits: List[float] = []
-    entropies_bits: List[float] = []
-    scored_tokens: List[str] = []
-    pred_cols_per_pos: List[List[str]] = []
-
+    
+    # Get context boundary
+    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
+    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    
+    scored_tokens = []
+    surprisals = []
+    entropies = []
+    pred_columns = []
+    
     for pos in range(len(input_ids)):
-        if special_tokens_mask[pos]:
+        # Skip special tokens and context
+        if special_mask[pos] or pos <= ctx_last:
             continue
-        if pos <= ctx_last:
-            continue
-
-        masked_input_ids = input_ids.clone()
-        masked_input_ids[pos] = tokenizer.mask_token_id
-
+        
+        # Mask current position
+        masked_ids = input_ids.clone()
+        masked_ids[pos] = tokenizer.mask_token_id
+        
+        # Get predictions
         with torch.no_grad():
-            outputs = model(masked_input_ids.unsqueeze(0))
-            logits = outputs.logits
+            logits = model(masked_ids.unsqueeze(0)).logits[0, pos]
+        
+        probs = torch.softmax(logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        
+        actual_id = input_ids[pos].item()
+        surprisal = -log_probs[actual_id].item() / LN2
+        entropy = -(probs * log_probs).sum().item() / LN2
+        
+        # Top-k predictions
+        top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
+        top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
+        
+        pred_col = [top_k_tokens[0]] + top_k_tokens
+        
+        scored_tokens.append(tokenizer.decode([actual_id]))
+        surprisals.append(surprisal)
+        entropies.append(entropy)
+        pred_columns.append(pred_col)
+    
+    return scored_tokens, surprisals, entropies, pred_columns
 
-        masked_pos_logits = logits[0, pos, :]
-        probs = torch.softmax(masked_pos_logits, dim=-1)
-        log_probs = torch.log_softmax(masked_pos_logits, dim=-1)
 
-        actual_token_id = input_ids[pos].item()
-        token_log_prob = log_probs[actual_token_id].item()
-        surprisal_bits = -token_log_prob / LN2
-        entropy_nats = -(probs * log_probs).sum().item()
-        entropy_bits = entropy_nats / LN2
+# ============================================================================
+# I/O functions
+# ============================================================================
 
-        # Decode human-readable piece (true token)
-        piece_true = tokenizer.decode([actual_token_id], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        piece_true = _safe_piece(piece_true)
+def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, str]]:
+    """Load input TSV and return list of (doc_id, sentence_id, sentence)."""
+    data = []
+    
+    with open(input_file, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter='\t')
+        next(reader)  # Skip header
+        
+        for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is line 1)
+            if not row or all(cell.strip() == '' for cell in row):  # Skip empty rows
+                continue
+                
+            if format_type == 'documents':
+                if len(row) < 2:
+                    print(f"Warning: Skipping malformed row {row_num}: expected 2 columns, got {len(row)}")
+                    continue
+                doc_id, text = row[0], row[1]
+                sentences = simple_sentence_split(text)
+                for sent_idx, sent in enumerate(sentences, 1):
+                    data.append((doc_id, str(sent_idx), sent))
+            else:  # sentences
+                if len(row) < 3:
+                    print(f"Warning: Skipping malformed row {row_num}: expected 3 columns, got {len(row)}")
+                    continue
+                doc_id, sent_id, sentence = row[0], row[1], row[2]
+                data.append((doc_id, sent_id, sentence))
+    
+    return data
 
-        # Top-1 predicted token for the mask
-        top1_id = int(torch.argmax(masked_pos_logits).item())
-        pred_top = tokenizer.decode([top1_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        pred_top = _safe_piece(pred_top)
 
-        scored_tokens.append(piece_true)
-        surprisals_bits.append(surprisal_bits)
-        entropies_bits.append(entropy_bits)
-        pred_cols_per_pos.append([pred_top])
+def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str):
+    """Write results to TSV with dynamic column headers."""
+    if not results:
+        return
+    
+    # Build header
+    base_cols = ['doc_id', 'sentence_id', 'token_index', 'token', 'surprisal_bits', 'entropy_bits', 'pred_top']
+    top_k_cols = [f'top_k_{i}' for i in range(1, top_k + 1)]
+    
+    if mode == 'ar':
+        lookahead_cols = [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
+        header = base_cols + top_k_cols + lookahead_cols
+    else:
+        header = base_cols + top_k_cols
+    
+    with open(output_file, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=header, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(results)
 
-    return scored_tokens, surprisals_bits, entropies_bits, pred_cols_per_pos
 
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple surprisal and entropy computation with constant left context and greedy next-token lookahead")
-    parser.add_argument("--input_file", required=True, help="TSV file with doc_id and text columns")
-    parser.add_argument("--mode", required=True, choices=["ar", "mlm"], help="ar=autoregressive (GPT), mlm=masked language model (BERT)")
-    parser.add_argument("--model", required=True, help="HuggingFace model name")
-    parser.add_argument("--output_file", default="simple_output.tsv", help="Output TSV file")
-    parser.add_argument("--format", choices=["documents", "sentences"], default="documents",
-                        help="Input format: 'documents' (doc_id, text) or 'sentences' (doc_id, sentence_id, sentence)")
-    parser.add_argument("--left_context_file", default="", help="Optional path to .txt file with left-context text; omit for no left context")
-    parser.add_argument("--lookahead_n", type=int, default=3, help="AR only: number of greedy follow tokens after top-1 to show (default=3)")
-    parser.add_argument("--include_special_tokens", action="store_true", help="Include special tokens (e.g., EOS) in AR outputs if present")
-
+    parser = argparse.ArgumentParser(description="Compute per-token surprisal and entropy.")
+    parser.add_argument('--input_file', required=True, help='Input TSV file')
+    parser.add_argument('--output_file', default='simple_output.tsv', help='Output TSV file')
+    parser.add_argument('--mode', choices=['ar', 'mlm'], required=True, help='Model mode')
+    parser.add_argument('--model', required=True, help='Model name from HuggingFace')
+    parser.add_argument('--format', choices=['documents', 'sentences'], required=True, help='Input format')
+    parser.add_argument('--left_context_file', default='', help='File with left context')
+    parser.add_argument('--top_k', type=int, default=5, help='Number of top-k predictions')
+    parser.add_argument('--lookahead_n', type=int, default=3, help='AR: greedy lookahead tokens')
+    parser.add_argument('--include_special_tokens', action='store_true', help='AR: include special tokens')
+    
     args = parser.parse_args()
-
-    print(f"Loading model: {args.model}")
-
-    if args.mode == "ar":
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    
+    # Load context
+    left_context = read_left_context(args.left_context_file) if args.left_context_file else ''
+    
+    # Load model
+    print(f"Loading {args.mode.upper()} model: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    
+    if args.mode == 'ar':
         model = AutoModelForCausalLM.from_pretrained(args.model)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        score_fn = lambda s: score_autoregressive(
+            s, left_context, tokenizer, model, args.top_k, args.lookahead_n, args.include_special_tokens
+        )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
         model = AutoModelForMaskedLM.from_pretrained(args.model)
-
+        score_fn = lambda s: score_masked_lm(s, left_context, tokenizer, model, args.top_k)
+    
     model.eval()
-
-    # Load optional left context
-    if args.left_context_file:
-        left_context = _read_left_context(args.left_context_file)
-        print(f"Loaded left context ({len(left_context)} chars) from {args.left_context_file}.")
-    else:
-        left_context = ""
-        print("No left context (empty).")
-
-    print(f"Processing {args.format} from: {args.input_file}")
-
-    with open(args.input_file, "r", encoding="utf-8") as fin:
-        total_rows = sum(1 for _ in csv.reader(fin, delimiter="\t")) - 1  # -1 for header
-
-    with open(args.input_file, "r", encoding="utf-8") as fin, \
-         open(args.output_file, "w", encoding="utf-8", newline="") as fout:
-
-        reader = csv.reader(fin, delimiter="\t")
-        writer = csv.writer(fout, delimiter="\t")
-
-        # Header with greedy columns
-        header = ["doc_id", "sentence_id", "token_index", "token", "surprisal_bits", "entropy_bits", "pred_top"]
-        header.extend([f"pred_next_{i}" for i in range(1, args.lookahead_n + 1)])
-        writer.writerow(header)
-
-        # Skip input header row
-        next(reader, None)
-
-        progress_desc = f"Processing {args.format}"
-        with tqdm(total=total_rows, desc=progress_desc, unit="item") as pbar:
-
-            if args.format == "sentences":
-                # Input format: doc_id, sentence_id, sentence
-                for row in reader:
-                    if len(row) < 3:
-                        pbar.update(1)
-                        continue
-
-                    doc_id, sentence_id, sentence = row[0], row[1], row[2]
-
-                    if args.mode == "ar":
-                        tokens, surprisals, entropies, pred_cols = score_autoregressive_with_context(
-                            sentence, left_context, tokenizer, model, lookahead_n=args.lookahead_n, include_special_tokens=args.include_special_tokens
-                        )
-                    else:
-                        tokens, surprisals, entropies, pred_cols = score_masked_lm_with_context(
-                            sentence, left_context, tokenizer, model
-                        )
-
-                    for i, (token, surprisal, entropy, preds) in enumerate(zip(tokens, surprisals, entropies, pred_cols)):
-                        row_out = [doc_id, sentence_id, i, token, f"{surprisal:.6f}", f"{entropy:.6f}"]
-                        # Pad or trim to exactly 1 + lookahead_n columns (pred_top + pred_next_*):
-                        padded = (preds + [""] * (1 + args.lookahead_n))[: 1 + args.lookahead_n]
-                        row_out.extend(padded)
-                        writer.writerow(row_out)
-
-                    pbar.update(1)
-
-            else:
-                # documents format: doc_id, text
-                for row in reader:
-                    if len(row) < 2:
-                        pbar.update(1)
-                        continue
-
-                    doc_id, text = row[0], row[1]
-                    sentences = simple_sentence_split(text)
-
-                    for sent_idx, sentence in enumerate(sentences):
-                        if not sentence.strip():
-                            continue
-
-                        if args.mode == "ar":
-                            tokens, surprisals, entropies, pred_cols = score_autoregressive_with_context(
-                                sentence, left_context, tokenizer, model, lookahead_n=args.lookahead_n, include_special_tokens=args.include_special_tokens
-                            )
-                        else:
-                            tokens, surprisals, entropies, pred_cols = score_masked_lm_with_context(
-                                sentence, left_context, tokenizer, model
-                            )
-
-                        for i, (token, surprisal, entropy, preds) in enumerate(zip(tokens, surprisals, entropies, pred_cols)):
-                            row_out = [doc_id, sent_idx, i, token, f"{surprisal:.6f}", f"{entropy:.6f}"]
-                            padded = (preds + [""] * (1 + args.lookahead_n))[: 1 + args.lookahead_n]
-                            row_out.extend(padded)
-                            writer.writerow(row_out)
-
-                    pbar.update(1)
-
+    
+    # Load data
+    print(f"Loading input from: {args.input_file}")
+    data = load_input_data(args.input_file, args.format)
+    
+    # Process
+    results = []
+    for doc_id, sent_id, sentence in tqdm(data, desc="Processing"):
+        tokens, surprisals, entropies, pred_cols = score_fn(sentence)
+        
+        for idx, (token, surp, ent, preds) in enumerate(zip(tokens, surprisals, entropies, pred_cols), 1):
+            row = {
+                'doc_id': doc_id,
+                'sentence_id': sent_id,
+                'token_index': idx,
+                'token': token,
+                'surprisal_bits': f'{surp:.4f}',
+                'entropy_bits': f'{ent:.4f}',
+                'pred_top': preds[0]
+            }
+            
+            # Add top-k columns
+            for i in range(1, args.top_k + 1):
+                row[f'top_k_{i}'] = preds[i] if i < len(preds) else ''
+            
+            # Add lookahead columns (AR only)
+            if args.mode == 'ar':
+                offset = args.top_k + 1
+                for i in range(1, args.lookahead_n + 1):
+                    row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+            
+            results.append(row)
+    
+    # Write output
+    write_output(args.output_file, results, args.top_k, args.lookahead_n, args.mode)
     print(f"Results written to: {args.output_file}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
