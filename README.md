@@ -7,6 +7,12 @@ spaghett is a simple python tool to extract surprisal-based features from text
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
 * Simple Command Line Interface, no need to modify the code (but it should be easy to do so if you need to)
 
+Similar work
+* [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models, but no entropy and no next word. It does an alternate type of MLM scoring and other stuff you might need.
+* [pangoling for R]([https://cran.r-project.org/web/packages/pangoling/vignettes/example.html](https://docs.ropensci.org/pangoling/) Uses python internally. Does AR and masked too, but surprisal scores only.
+* [psychformers for python](https://github.com/jmichaelov/PsychFormers)Supports different types of models, but only does surprisal scores for now.
+* [lm-scorer](https://github.com/simonepri/lm-scorer)Focus is on scoring whole sentences, only surprisal scores.
+  
 Installation
 * You will need python, install if you don't have it already.
 * Install the libraries in requirements.txt
