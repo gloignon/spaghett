@@ -21,21 +21,19 @@ spaghett is a simple python tool to extract surprisal-based features from text
 # How to use
 * Input is a .tsv file. Expected columns are doc_id and text (in documents mode), or doc_id, sentence_id and sentence (in sentences mode). The first row is expected to the column headers and will be skipper.
 * CLI parameters
+```
     --input_file: Path to the input TSV file with documents or sentences.
-  
     --output_file: Path to the output TSV file (default: simple_output.tsv).
-  
     --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
-  
     --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
-  
-    --format: 'documents' or 'sentences' to specify input format (will use a crude sentence splitter if documents is used)
-  
-    --left_context_file: Optional, path to a .txt file whose contents are prepended as left-context to every sentence.
-  
-    --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default=3).
-  
-    --include_special_tokens: (AR only) Include special tokens (e.g., EOS) in AR outputs if present.
+    --format: 'documents' or 'sentences' to specify input format.
+    --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
+    --top_k: Number of top probable tokens to output (default: 5).
+    --lookahead_n: (AR only) Number of follow tokens to generate (default: 3).
+    --lookahead_strategy: (AR only) Strategy for generating follow tokens: 'greedy' or 'beam' (default: greedy).
+    --beam_width: (AR only) Beam width for beam search (default: 3, only used when --lookahead_strategy=beam).
+```
+
   * Example run (will run on the demo sentences, using the French LLM disticamembert).
 ```
     python -u "src\main.py" --input_file "in\demo_sentences.tsv"  --output_file "out\demo_sentences_out.tsv"  --mode mlm  --model cmarkea/distilcamembert-base  --format sentences
