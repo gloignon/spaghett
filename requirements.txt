@@ -1,0 +1,13 @@
+# The basics
+torch>=1.13.1
+transformers>=4.30.0
+tqdm>=4.64.1
+
+# These are usually called by HuggingFace models
+# But you might need to install them explicitly
+sentencepiece>=0.1.97
+tokenizers>=0.13.2
+protobuf>=3.20.0
+
+# Small helper for newer typing features on older Pythons (optional)
+typing-extensions>=4.0.0
