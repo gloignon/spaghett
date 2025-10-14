@@ -1,7 +1,8 @@
 spaghett is a simple python tool to extract surprisal-based features from text
 * Works with AR and masked-token models from Hugging Face
 * Extracts surprisal, entropy and the next predicted word with the highest probability (i.e. what the LLM computed would be the continuation)
-* Works sentence by sentence only (for now), but you can provide a common context file to for semantic continuity
+* Works sentence by sentence only (for now), but you can provide a common context file for semantic continuity, it will be prepended to each sentence's context window.
+* Choice of greedy algorithm or beam search to identify the most probable next word (will assemble next subtokens to reconstitute the word).
 * Minimalism over performance: simple loops used in place of batching, no CUDA, nothing fancy
 * Should not mess up accented characters
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
@@ -43,4 +44,3 @@ spaghett is a simple python tool to extract surprisal-based features from text
 * Make a wrapper for R (ideally, a package)
 * Add different modes for analysis window (e.g. previous sentence, previous n words, pseudo AR for masked token model, as big as the LLM can go, etc.)
 * Make another version that would have fancy batching, GPU acceleration, etc.
-* Most probably next word is identified using a simple greedy algorithm, add the option to use beam search instead
