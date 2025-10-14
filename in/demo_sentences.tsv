@@ -1,0 +1,19 @@
+doc_id	sentence_id	sentence
+demo1	1	Il m'a donné une livre.
+demo2	1	Nous avons choisi un forfait tout inclus.
+demo2	2	Nous avons choisi un le meilleur forfait pour les vacances de printemps. 
+demo3	1	Marie a pris le livre. Elle l'a prise.
+demo4	2	Marie a pris la pomme. Elle l'a prise.
+demo4	3	Marie a pris la pomme. Elle l'a pris.
+demo5	1	Le chat est sur le tapis.
+demo5	2	Le chat est sur la tapis.
+demo5	3	Le chat est sur le concept.
+demo5	4	Le concept est sur le tapis.
+demo5	5	Le tapis est sur le chat.
+demo5	6	Le chat est sous le tapis.
+demo5	7	Le chat est dans le tapis.
+demo5	8	Le chat est sur la moquette.
+demo5	9	Le chat est sur le kilim.
+demo5	10	Le chat est sur le.
+
+
