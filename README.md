@@ -7,17 +7,18 @@ spaghett is a simple python tool to extract surprisal-based features from text
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
 * Simple Command Line Interface, no need to modify the code (but it should be easy to do so if you need to)
 
-Similar work
+# Similar work
 * [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models, but no entropy and no next word. It does an alternate type of MLM scoring and other stuff you might need.
-* [pangoling for R]([https://cran.r-project.org/web/packages/pangoling/vignettes/example.html](https://docs.ropensci.org/pangoling/) Uses python internally. Does AR and masked too, but surprisal scores only.
+* [pangoling for R](https://docs.ropensci.org/pangoling/) Uses python internally. Does AR and masked too, but surprisal scores only.
+* [text for R](https://cran.r-project.org/web/packages/text/index.html)Does word embeddings computations, not surprisal-based features.
 * [psychformers for python](https://github.com/jmichaelov/PsychFormers)Supports different types of models, but only does surprisal scores for now.
 * [lm-scorer](https://github.com/simonepri/lm-scorer)Focus is on scoring whole sentences, only surprisal scores.
   
-Installation
+# Installation
 * You will need python, install if you don't have it already.
 * Install the libraries in requirements.txt
 
-How to use
+# How to use
 * Input is a .tsv file. Expected columns are doc_id and text (in documents mode), or doc_id, sentence_id and sentence (in sentences mode). The first row is expected to the column headers and will be skipper.
 * CLI parameters
     --input_file: Path to the input TSV file with documents or sentences.
@@ -40,8 +41,8 @@ How to use
     python -u "src\main.py" --input_file "in\demo_sentences.tsv"  --output_file "out\demo_sentences_out.tsv"  --mode mlm  --model cmarkea/distilcamembert-base  --format sentences
 ```
 
-TODO: 
-* Make a wrapper for R
+# TODO: 
+* Make a wrapper for R (ideally, a package)
 * Add different modes for analysis window (e.g. previous sentence, previous n words, pseudo AR for masked token model, as big as the LLM can go, etc.)
 * Make another version that would have fancy batching, GPU acceleration, etc.
 * Most probably next word is identified using a simple greedy algorithm, add the option to use beam search instead
