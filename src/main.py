@@ -11,20 +11,84 @@ CLI parameters:
     --format: 'documents' or 'sentences' to specify input format.
     --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
     --top_k: Number of top probable tokens to output (default: 5).
-    --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default: 3).
+    --lookahead_n: (AR only) Number of follow tokens to generate (default: 3).
+    --lookahead_strategy: (AR only) Strategy for generating follow tokens: 'greedy' or 'beam' (default: greedy).
+    --beam_width: (AR only) Beam width for beam search (default: 3, only used when --lookahead_strategy=beam).
 
 Input TSV formats:
     - documents: doc_id<TAB>text (with header)
     - sentences: doc_id<TAB>sentence_id<TAB>sentence (with header)
 
-Outputs TSV with columns:
-    doc_id, sentence_id, token_index, token, is_special, is_context, surprisal_bits, entropy_bits, pred_top, top_k_1..top_k_N, pred_next_1..pred_next_N
+Output TSV columns:
+    doc_id (str): 
+        Document identifier from input file.
+    
+    sentence_id (str): 
+        Sentence identifier within the document. Auto-generated for 'documents' format.
+    
+    token_index (int): 
+        Position of the token within the sentence (1-indexed).
+    
+    token (str): 
+        The actual token text. Special tokens (BOS/EOS/CLS/SEP) shown as token symbols (e.g., '<s>', '</s>').
+    
+    is_special (int): 
+        Flag indicating if token is a special token (1) or regular content token (0).
+        Special tokens include BOS, EOS, CLS, SEP, PAD, MASK, etc.
+    
+    is_context (int): 
+        Flag indicating if token belongs to left context (1) or actual sentence (0).
+        Only relevant when --left_context_file is provided.
+    
+    surprisal_bits (float): 
+        Surprisal value in bits: -log2(p(token|context)).
+        Measures how unexpected the token is given prior context.
+        Higher values = more surprising/unexpected.
+        Empty for first token in AR mode (no prior context to condition on).
+        AR mode: conditioned on all previous tokens.
+        MLM mode: conditioned on bidirectional context (all other tokens).
+    
+    entropy_bits (float): 
+        Shannon entropy of the probability distribution over all possible next tokens, in bits.
+        Measures uncertainty/predictability at this position.
+        Higher values = more uncertain/less predictable.
+        Empty for first token in AR mode.
+        Range: 0 (completely certain) to log2(vocab_size) (uniform distribution).
+    
+    pred_top (str): 
+        The most probable token predicted by the model at this position.
+        AR mode: most probable next token given context up to current position.
+        MLM mode: most probable token for masked position given bidirectional context.
+    
+    top_k_1 through top_k_N (str): 
+        The top-k most probable tokens, ranked by probability (1=highest).
+        Number of columns determined by --top_k parameter.
+        Useful for analyzing alternative predictions and model confidence.
+    
+    pred_next_1 through pred_next_M (str): 
+        (AR mode only) Continuation tokens generated from current position.
+        Number of columns determined by --lookahead_n parameter.
+        Generation strategy determined by --lookahead_strategy:
+            - 'greedy': selects highest probability token at each step
+            - 'beam': uses beam search to find most probable sequence
+        Useful for understanding what word/phrase the model expects to follow.
 
 Notes:
-    - All tokens are now scored, including BOS, EOS, and other special tokens
-    - is_special column: 1 if token is a special token (BOS/EOS/PAD/etc), 0 otherwise
-    - is_context column: 1 if token belongs to left context, 0 if part of actual sentence
-    - Users can filter by these columns in post-processing if desired
+    - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc).
+    - First token in AR mode has empty surprisal/entropy (no prior context).
+    - Users can filter rows using is_special and is_context columns in post-processing.
+    - Surprisal and entropy are in bits (log base 2) for interpretability.
+    - 1 bit of surprisal = halving the probability (p=0.5 → 1 bit, p=0.25 → 2 bits, etc).
+
+Example filtering commands:
+    # Keep only content tokens (no special tokens):
+    awk -F'\t' '$5 == 0' output.tsv
+    
+    # Keep only sentence tokens (exclude left context):
+    awk -F'\t' '$6 == 0' output.tsv
+    
+    # Keep only scored sentence content:
+    awk -F'\t' '$5 == 0 && $6 == 0' output.tsv
 """
 
 import argparse
@@ -91,82 +155,8 @@ def get_context_boundary(token_ids: List[int], context_ids: List[int], special_m
 
 
 # ============================================================================
-# Scoring functions
+# Lookahead generation functions
 # ============================================================================
-
-def score_autoregressive(
-    sentence: str,
-    left_context: str,
-    tokenizer,
-    model,
-    top_k: int = 5,
-    lookahead_n: int = 3
-) -> Tuple[List[str], List[int], List[int], List[float], List[float], List[List[str]]]:
-    """
-    Score sentence with AR model. Returns tokens, is_special flags, is_context flags,
-    surprisals, entropies, and prediction columns.
-    
-    Now scores ALL tokens including special tokens (BOS, EOS, etc).
-    """
-    combined = combine_context_and_sentence(left_context, sentence)
-    encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
-    input_ids = encoding["input_ids"][0]
-    
-    if len(input_ids) < 2:
-        return [], [], [], [], [], []
-    
-    # Get context boundary and special token mask
-    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
-    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
-    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
-    
-    # Get logits
-    with torch.no_grad():
-        logits = model(input_ids.unsqueeze(0)).logits[0]
-    
-    scored_tokens = []
-    is_special_flags = []
-    is_context_flags = []
-    surprisals = []
-    entropies = []
-    pred_columns = []
-    
-    for pos in range(len(input_ids) - 1):
-        target_pos = pos + 1
-        target_id = input_ids[target_pos].item()
-        
-        # Compute probabilities
-        pos_logits = logits[pos]
-        probs = torch.softmax(pos_logits, dim=-1)
-        log_probs = torch.log_softmax(pos_logits, dim=-1)
-        
-        # Surprisal and entropy
-        surprisal = -log_probs[target_id].item() / LN2
-        entropy = -(probs * log_probs).sum().item() / LN2
-        
-        # Top-k predictions
-        top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
-        top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
-        
-        # Greedy lookahead
-        lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:target_pos + 1], n=lookahead_n)
-        
-        # Build prediction column: [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M]
-        pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
-        
-        # Track flags
-        is_special = 1 if special_mask[target_pos] else 0
-        is_context = 1 if target_pos <= ctx_last else 0
-        
-        scored_tokens.append(tokenizer.decode([target_id]))
-        is_special_flags.append(is_special)
-        is_context_flags.append(is_context)
-        surprisals.append(surprisal)
-        entropies.append(entropy)
-        pred_columns.append(pred_col)
-    
-    return scored_tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_columns
-
 
 def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List[str]:
     """Generate n greedy next tokens from prefix."""
@@ -185,6 +175,140 @@ def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List
         current = torch.cat([current, torch.tensor([next_id])])
     
     return lookahead
+
+
+def beam_search_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int, beam_width: int = 3) -> List[str]:
+    """Generate n tokens using beam search and return the best sequence."""
+    if n <= 0:
+        return []
+    
+    # Initialize beams: [(sequence, cumulative_log_prob)]
+    beams = [(prefix_ids.clone(), 0.0)]
+    
+    for step in range(n):
+        candidates = []
+        
+        for seq, score in beams:
+            with torch.no_grad():
+                logits = model(seq.unsqueeze(0)).logits[0, -1]
+            
+            log_probs = torch.log_softmax(logits, dim=-1)
+            
+            # Get top beam_width candidates
+            top_log_probs, top_ids = torch.topk(log_probs, k=min(beam_width, len(log_probs)))
+            
+            for log_prob, token_id in zip(top_log_probs.tolist(), top_ids.tolist()):
+                new_seq = torch.cat([seq, torch.tensor([token_id])])
+                new_score = score + log_prob
+                candidates.append((new_seq, new_score))
+        
+        # Keep top beam_width sequences
+        beams = sorted(candidates, key=lambda x: x[1], reverse=True)[:beam_width]
+    
+    # Return best sequence (excluding prefix)
+    best_seq = beams[0][0]
+    lookahead_ids = best_seq[len(prefix_ids):].tolist()
+    return [tokenizer.decode([tid]) for tid in lookahead_ids]
+
+
+# ============================================================================
+# Scoring functions
+# ============================================================================
+
+def score_autoregressive(
+    sentence: str,
+    left_context: str,
+    tokenizer,
+    model,
+    top_k: int = 5,
+    lookahead_n: int = 3,
+    lookahead_strategy: str = 'greedy',
+    beam_width: int = 3
+) -> Tuple[List[str], List[int], List[int], List[float], List[float], List[List[str]]]:
+    """
+    Score sentence with AR model. Returns tokens, is_special flags, is_context flags,
+    surprisals, entropies, and prediction columns.
+    
+    Now scores ALL tokens including special tokens (BOS, EOS, etc).
+    For the first token (index 0), surprisal and entropy are set to NaN since there's no prior context.
+    """
+    combined = combine_context_and_sentence(left_context, sentence)
+    encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
+    input_ids = encoding["input_ids"][0]
+    
+    if len(input_ids) < 1:
+        return [], [], [], [], [], []
+    
+    # Get context boundary and special token mask
+    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
+    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    
+    # Get logits (only if we have at least 2 tokens)
+    if len(input_ids) > 1:
+        with torch.no_grad():
+            logits = model(input_ids.unsqueeze(0)).logits[0]
+    else:
+        logits = None
+    
+    scored_tokens = []
+    is_special_flags = []
+    is_context_flags = []
+    surprisals = []
+    entropies = []
+    pred_columns = []
+    
+    # Process all tokens starting from index 0
+    for pos in range(len(input_ids)):
+        target_id = input_ids[pos].item()
+        
+        # Track flags
+        is_special = 1 if special_mask[pos] else 0
+        is_context = 1 if pos <= ctx_last else 0
+        
+        # Use special token string if it's a special token, otherwise decode normally
+        if is_special:
+            token_str = tokenizer.convert_ids_to_tokens([target_id])[0]
+        else:
+            token_str = tokenizer.decode([target_id])
+        
+        # For position 0, we can't compute surprisal/entropy (no prior context)
+        if pos == 0:
+            surprisal = float('nan')
+            entropy = float('nan')
+            pred_col = [''] * (1 + top_k + lookahead_n)  # Empty predictions
+        else:
+            # Compute probabilities using previous position's logits
+            pos_logits = logits[pos - 1]
+            probs = torch.softmax(pos_logits, dim=-1)
+            log_probs = torch.log_softmax(pos_logits, dim=-1)
+            
+            # Surprisal and entropy
+            surprisal = -log_probs[target_id].item() / LN2
+            entropy = -(probs * log_probs).sum().item() / LN2
+            
+            # Top-k predictions
+            top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
+            top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
+            
+            # Lookahead generation
+            if lookahead_strategy == 'beam':
+                lookahead_tokens = beam_search_lookahead(model, tokenizer, input_ids[:pos + 1], 
+                                                         n=lookahead_n, beam_width=beam_width)
+            else:  # greedy
+                lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:pos + 1], n=lookahead_n)
+            
+            # Build prediction column: [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M]
+            pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
+        
+        scored_tokens.append(token_str)
+        is_special_flags.append(is_special)
+        is_context_flags.append(is_context)
+        surprisals.append(surprisal)
+        entropies.append(entropy)
+        pred_columns.append(pred_col)
+    
+    return scored_tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_columns
 
 
 def score_masked_lm(
@@ -333,7 +457,10 @@ def main():
     parser.add_argument('--format', choices=['documents', 'sentences'], required=True, help='Input format')
     parser.add_argument('--left_context_file', default='', help='File with left context')
     parser.add_argument('--top_k', type=int, default=5, help='Number of top-k predictions')
-    parser.add_argument('--lookahead_n', type=int, default=3, help='AR: greedy lookahead tokens')
+    parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens')
+    parser.add_argument('--lookahead_strategy', choices=['greedy', 'beam'], default='greedy', 
+                       help='AR: lookahead strategy (greedy or beam search)')
+    parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search')
     
     args = parser.parse_args()
     
@@ -347,7 +474,8 @@ def main():
     if args.mode == 'ar':
         model = AutoModelForCausalLM.from_pretrained(args.model)
         score_fn = lambda s: score_autoregressive(
-            s, left_context, tokenizer, model, args.top_k, args.lookahead_n
+            s, left_context, tokenizer, model, args.top_k, args.lookahead_n, 
+            args.lookahead_strategy, args.beam_width
         )
     else:
         model = AutoModelForMaskedLM.from_pretrained(args.model)
@@ -374,9 +502,9 @@ def main():
                 'token': token,
                 'is_special': is_special,
                 'is_context': is_context,
-                'surprisal_bits': f'{surp:.4f}',
-                'entropy_bits': f'{ent:.4f}',
-                'pred_top': preds[0]
+                'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
+                'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}',
+                'pred_top': preds[0] if preds else ''
             }
             
             # Add top-k columns

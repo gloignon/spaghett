@@ -9,9 +9,12 @@ if not exist "out" mkdir "out"
 python -u "src\main.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --output_file "out\demo_sentences_out.tsv" ^
-  --mode mlm ^
-  --model cmarkea/distilcamembert-base ^
-  --format sentences
+  --lookahead_strategy "beam" ^
+  --lookahead_n 3 ^
+  --top_k 3 ^
+  --mode "ar" ^
+  --model "lightonai/pagnol-small" ^
+  --format "sentences"
 
 if %ERRORLEVEL% EQU 0 (
   echo Finished: "out\demo_sentences_out.tsv"
