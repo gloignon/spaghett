@@ -1,3 +1,4 @@
+# pyright: reportGeneralTypeIssues=false
 """
 Simple script for computing per-token surprisal and entropy, by sentence, with extra left context,
 and exporting the top-k most probable next tokens for each scored token.
@@ -11,14 +12,19 @@ CLI parameters:
     --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
     --top_k: Number of top probable tokens to output (default: 5).
     --lookahead_n: (AR only) Number of greedy follow tokens after top-1 to show (default: 3).
-    --include_special_tokens: (AR only) Include special tokens in AR outputs if present.
 
 Input TSV formats:
     - documents: doc_id<TAB>text (with header)
     - sentences: doc_id<TAB>sentence_id<TAB>sentence (with header)
 
 Outputs TSV with columns:
-    doc_id, sentence_id, token_index, token, surprisal_bits, entropy_bits, pred_top, top_k_1..top_k_N, pred_next_1..pred_next_N
+    doc_id, sentence_id, token_index, token, is_special, is_context, surprisal_bits, entropy_bits, pred_top, top_k_1..top_k_N, pred_next_1..pred_next_N
+
+Notes:
+    - All tokens are now scored, including BOS, EOS, and other special tokens
+    - is_special column: 1 if token is a special token (BOS/EOS/PAD/etc), 0 otherwise
+    - is_context column: 1 if token belongs to left context, 0 if part of actual sentence
+    - Users can filter by these columns in post-processing if desired
 """
 
 import argparse
@@ -84,11 +90,6 @@ def get_context_boundary(token_ids: List[int], context_ids: List[int], special_m
     return ctx_start + len(context_ids) - 1
 
 
-def bits_to_float(bits: float) -> float:
-    """Convert bits to natural log scale."""
-    return bits / LN2
-
-
 # ============================================================================
 # Scoring functions
 # ============================================================================
@@ -99,21 +100,22 @@ def score_autoregressive(
     tokenizer,
     model,
     top_k: int = 5,
-    lookahead_n: int = 3,
-    include_special: bool = False
-) -> Tuple[List[str], List[float], List[float], List[List[str]]]:
+    lookahead_n: int = 3
+) -> Tuple[List[str], List[int], List[int], List[float], List[float], List[List[str]]]:
     """
-    Score sentence with AR model. Returns tokens, surprisals, entropies, and prediction columns.
-    Prediction columns include [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M].
+    Score sentence with AR model. Returns tokens, is_special flags, is_context flags,
+    surprisals, entropies, and prediction columns.
+    
+    Now scores ALL tokens including special tokens (BOS, EOS, etc).
     """
     combined = combine_context_and_sentence(left_context, sentence)
     encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
     input_ids = encoding["input_ids"][0]
     
     if len(input_ids) < 2:
-        return [], [], [], []
+        return [], [], [], [], [], []
     
-    # Get context boundary
+    # Get context boundary and special token mask
     special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
     context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
@@ -123,6 +125,8 @@ def score_autoregressive(
         logits = model(input_ids.unsqueeze(0)).logits[0]
     
     scored_tokens = []
+    is_special_flags = []
+    is_context_flags = []
     surprisals = []
     entropies = []
     pred_columns = []
@@ -130,12 +134,6 @@ def score_autoregressive(
     for pos in range(len(input_ids) - 1):
         target_pos = pos + 1
         target_id = input_ids[target_pos].item()
-        
-        # Skip context and optionally special tokens
-        if target_pos <= ctx_last:
-            continue
-        if not include_special and special_mask[target_pos]:
-            continue
         
         # Compute probabilities
         pos_logits = logits[pos]
@@ -156,12 +154,18 @@ def score_autoregressive(
         # Build prediction column: [pred_top, top_k_1..top_k_N, pred_next_1..pred_next_M]
         pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
         
+        # Track flags
+        is_special = 1 if special_mask[target_pos] else 0
+        is_context = 1 if target_pos <= ctx_last else 0
+        
         scored_tokens.append(tokenizer.decode([target_id]))
+        is_special_flags.append(is_special)
+        is_context_flags.append(is_context)
         surprisals.append(surprisal)
         entropies.append(entropy)
         pred_columns.append(pred_col)
     
-    return scored_tokens, surprisals, entropies, pred_columns
+    return scored_tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_columns
 
 
 def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List[str]:
@@ -189,10 +193,12 @@ def score_masked_lm(
     tokenizer,
     model,
     top_k: int = 5
-) -> Tuple[List[str], List[float], List[float], List[List[str]]]:
+) -> Tuple[List[str], List[int], List[int], List[float], List[float], List[List[str]]]:
     """
-    Score sentence with MLM. Returns tokens, surprisals, entropies, and prediction columns.
-    Prediction columns include [pred_top, top_k_1..top_k_N].
+    Score sentence with MLM. Returns tokens, is_special flags, is_context flags,
+    surprisals, entropies, and prediction columns.
+    
+    Now scores ALL tokens including special tokens (CLS, SEP, etc).
     """
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
@@ -202,23 +208,21 @@ def score_masked_lm(
     input_ids = encoding["input_ids"][0]
     
     if len(input_ids) < 2:
-        return [], [], [], []
+        return [], [], [], [], [], []
     
-    # Get context boundary
+    # Get context boundary and special token mask
     special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
     context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
     
     scored_tokens = []
+    is_special_flags = []
+    is_context_flags = []
     surprisals = []
     entropies = []
     pred_columns = []
     
     for pos in range(len(input_ids)):
-        # Skip special tokens and context
-        if special_mask[pos] or pos <= ctx_last:
-            continue
-        
         # Mask current position
         masked_ids = input_ids.clone()
         masked_ids[pos] = tokenizer.mask_token_id
@@ -240,12 +244,24 @@ def score_masked_lm(
         
         pred_col = [top_k_tokens[0]] + top_k_tokens
         
-        scored_tokens.append(tokenizer.decode([actual_id]))
+        # Track flags
+        is_special = 1 if special_mask[pos] else 0
+        is_context = 1 if pos <= ctx_last else 0
+        
+        # Use special token string if it's a special token, otherwise decode normally
+        if is_special:
+            token_str = tokenizer.convert_ids_to_tokens([actual_id])[0]
+        else:
+            token_str = tokenizer.decode([actual_id])
+        
+        scored_tokens.append(token_str)
+        is_special_flags.append(is_special)
+        is_context_flags.append(is_context)
         surprisals.append(surprisal)
         entropies.append(entropy)
         pred_columns.append(pred_col)
     
-    return scored_tokens, surprisals, entropies, pred_columns
+    return scored_tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_columns
 
 
 # ============================================================================
@@ -260,8 +276,8 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
         reader = csv.reader(f, delimiter='\t')
         next(reader)  # Skip header
         
-        for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is line 1)
-            if not row or all(cell.strip() == '' for cell in row):  # Skip empty rows
+        for row_num, row in enumerate(reader, start=2):
+            if not row or all(cell.strip() == '' for cell in row):
                 continue
                 
             if format_type == 'documents':
@@ -288,7 +304,8 @@ def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n:
         return
     
     # Build header
-    base_cols = ['doc_id', 'sentence_id', 'token_index', 'token', 'surprisal_bits', 'entropy_bits', 'pred_top']
+    base_cols = ['doc_id', 'sentence_id', 'token_index', 'token', 'is_special', 'is_context', 
+                 'surprisal_bits', 'entropy_bits', 'pred_top']
     top_k_cols = [f'top_k_{i}' for i in range(1, top_k + 1)]
     
     if mode == 'ar':
@@ -317,7 +334,6 @@ def main():
     parser.add_argument('--left_context_file', default='', help='File with left context')
     parser.add_argument('--top_k', type=int, default=5, help='Number of top-k predictions')
     parser.add_argument('--lookahead_n', type=int, default=3, help='AR: greedy lookahead tokens')
-    parser.add_argument('--include_special_tokens', action='store_true', help='AR: include special tokens')
     
     args = parser.parse_args()
     
@@ -331,7 +347,7 @@ def main():
     if args.mode == 'ar':
         model = AutoModelForCausalLM.from_pretrained(args.model)
         score_fn = lambda s: score_autoregressive(
-            s, left_context, tokenizer, model, args.top_k, args.lookahead_n, args.include_special_tokens
+            s, left_context, tokenizer, model, args.top_k, args.lookahead_n
         )
     else:
         model = AutoModelForMaskedLM.from_pretrained(args.model)
@@ -346,14 +362,18 @@ def main():
     # Process
     results = []
     for doc_id, sent_id, sentence in tqdm(data, desc="Processing"):
-        tokens, surprisals, entropies, pred_cols = score_fn(sentence)
+        tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_cols = score_fn(sentence)
         
-        for idx, (token, surp, ent, preds) in enumerate(zip(tokens, surprisals, entropies, pred_cols), 1):
+        for idx, (token, is_special, is_context, surp, ent, preds) in enumerate(
+            zip(tokens, is_special_flags, is_context_flags, surprisals, entropies, pred_cols), 1
+        ):
             row = {
                 'doc_id': doc_id,
                 'sentence_id': sent_id,
                 'token_index': idx,
                 'token': token,
+                'is_special': is_special,
+                'is_context': is_context,
                 'surprisal_bits': f'{surp:.4f}',
                 'entropy_bits': f'{ent:.4f}',
                 'pred_top': preds[0]
