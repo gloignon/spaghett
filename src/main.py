@@ -218,25 +218,27 @@ def score_autoregressive(
     
     Left context is used for conditioning but NOT included in output.
     """
-    combined = combine_context_and_sentence(left_context, sentence)
-    encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
-    input_ids = encoding["input_ids"][0]
+    # Tokenize sentence ONLY (no context concatenation)
+    encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
+    sentence_ids = encoding["input_ids"][0]
     
-    if len(input_ids) < 1:
+    if len(sentence_ids) < 1:
         return [], [], [], [], []
     
-    # Get context boundary and special token mask
-    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
-    if context_ids is None:
-        context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
-    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    # Get special token mask for sentence tokens only
+    special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # ONLY compute logits if we have sentence tokens to score (after context)
-    if ctx_last >= len(input_ids) - 1:
-        # All tokens are context, nothing to score
-        return [], [], [], [], []
+    # Prepend context IDs for model input (if context exists)
+    if context_ids:
+        # Combine context + sentence for model input
+        input_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
+        # Offset for sentence tokens in combined sequence
+        sentence_start = len(context_ids)
+    else:
+        input_ids = sentence_ids
+        sentence_start = 0
     
-    # Get logits
+    # Get logits for combined sequence
     if len(input_ids) > 1:
         with torch.no_grad():
             logits = model(input_ids.unsqueeze(0)).logits[0]
@@ -249,12 +251,13 @@ def score_autoregressive(
     entropies = []
     pred_columns = []
     
-    # START from first sentence token (skip context entirely)
-    start_pos = ctx_last + 1 if ctx_last >= 0 else 0
-    
-    for pos in range(start_pos, len(input_ids)):
-        target_id = input_ids[pos].item()
-        is_special = 1 if special_mask[pos] else 0
+    # Score all sentence tokens
+    for sent_pos in range(len(sentence_ids)):
+        # Position in combined sequence (context + sentence)
+        combined_pos = sentence_start + sent_pos
+        
+        target_id = sentence_ids[sent_pos].item()
+        is_special = 1 if special_mask[sent_pos] else 0
         
         # Use special token string if it's a special token, otherwise decode normally
         if is_special:
@@ -262,35 +265,15 @@ def score_autoregressive(
         else:
             token_str = tokenizer.decode([target_id])
         
-        # For first sentence token, check if we can score it
-        if pos == start_pos:
-            if pos == 0:
-                # Very first token overall, can't score
-                surprisal = float('nan')
-                entropy = float('nan')
-                pred_col = [''] * (1 + top_k + lookahead_n)
-            else:
-                # First sentence token after context - CAN be scored using context
-                pos_logits = logits[pos - 1]
-                probs = torch.softmax(pos_logits, dim=-1)
-                log_probs = torch.log_softmax(pos_logits, dim=-1)
-                
-                surprisal = -log_probs[target_id].item() / LN2
-                entropy = -(probs * log_probs).sum().item() / LN2
-                
-                top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
-                top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
-                
-                if lookahead_strategy == 'beam':
-                    lookahead_tokens = beam_search_lookahead(model, tokenizer, input_ids[:pos + 1], 
-                                                             n=lookahead_n, beam_width=beam_width)
-                else:
-                    lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:pos + 1], n=lookahead_n)
-                
-                pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
+        # First token: check if we can score it
+        if combined_pos == 0:
+            # Very first token, can't score
+            surprisal = float('nan')
+            entropy = float('nan')
+            pred_col = [''] * (1 + top_k + lookahead_n)
         else:
-            # Regular token scoring
-            pos_logits = logits[pos - 1]
+            # Can be scored (has context or previous tokens)
+            pos_logits = logits[combined_pos - 1]
             probs = torch.softmax(pos_logits, dim=-1)
             log_probs = torch.log_softmax(pos_logits, dim=-1)
             
@@ -300,11 +283,12 @@ def score_autoregressive(
             top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
             top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
             
+            # Lookahead from current position in combined sequence
             if lookahead_strategy == 'beam':
-                lookahead_tokens = beam_search_lookahead(model, tokenizer, input_ids[:pos + 1], 
+                lookahead_tokens = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], 
                                                          n=lookahead_n, beam_width=beam_width)
             else:
-                lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:pos + 1], n=lookahead_n)
+                lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:combined_pos + 1], n=lookahead_n)
             
             pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
         
@@ -334,23 +318,25 @@ def score_masked_lm(
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
     
-    combined = combine_context_and_sentence(left_context, sentence)
-    encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
-    input_ids = encoding["input_ids"][0]
+    # Tokenize sentence ONLY (no context concatenation)
+    encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
+    sentence_ids = encoding["input_ids"][0]
     
-    if len(input_ids) < 1:
+    if len(sentence_ids) < 1:
         return [], [], [], [], []
     
-    # Get context boundary and special token mask
-    special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
-    if context_ids is None:
-        context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
-    ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    # Get special token mask for sentence tokens only
+    special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # ONLY process sentence tokens (skip context entirely)
-    if ctx_last >= len(input_ids) - 1:
-        # All tokens are context, nothing to score
-        return [], [], [], [], []
+    # Prepend context IDs for model input (if context exists)
+    if context_ids:
+        # Combine context + sentence for model input
+        base_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
+        # Offset for sentence tokens in combined sequence
+        sentence_start = len(context_ids)
+    else:
+        base_ids = sentence_ids
+        sentence_start = 0
     
     scored_tokens = []
     is_special_flags = []
@@ -358,24 +344,25 @@ def score_masked_lm(
     entropies = []
     pred_columns = []
     
-    # START from first sentence token
-    start_pos = ctx_last + 1 if ctx_last >= 0 else 0
-    
-    for pos in range(start_pos, len(input_ids)):
-        is_special = 1 if special_mask[pos] else 0
+    # Score all sentence tokens
+    for sent_pos in range(len(sentence_ids)):
+        # Position in combined sequence (context + sentence)
+        combined_pos = sentence_start + sent_pos
         
-        # Mask current position
-        masked_ids = input_ids.clone()
-        masked_ids[pos] = tokenizer.mask_token_id
+        is_special = 1 if special_mask[sent_pos] else 0
+        
+        # Mask current position in combined sequence
+        masked_ids = base_ids.clone()
+        masked_ids[combined_pos] = tokenizer.mask_token_id
         
         # Get predictions
         with torch.no_grad():
-            logits = model(masked_ids.unsqueeze(0)).logits[0, pos]
+            logits = model(masked_ids.unsqueeze(0)).logits[0, combined_pos]
         
         probs = torch.softmax(logits, dim=-1)
         log_probs = torch.log_softmax(logits, dim=-1)
         
-        actual_id = input_ids[pos].item()
+        actual_id = sentence_ids[sent_pos].item()
         surprisal = -log_probs[actual_id].item() / LN2
         entropy = -(probs * log_probs).sum().item() / LN2
         
