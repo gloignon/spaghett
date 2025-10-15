@@ -113,31 +113,45 @@ def combine_context_and_sentence(context: str, sentence: str) -> str:
     return context or sentence
 
 
-def find_token_subsequence(haystack: List[int], needle: List[int], start: int = 0) -> int:
-    """Find first occurrence of needle in haystack starting at index. Returns -1 if not found."""
-    if not needle:
-        return -1
-    
-    for i in range(start, len(haystack) - len(needle) + 1):
-        if haystack[i:i + len(needle)] == needle:
-            return i
-    return -1
+def decode_token(tokenizer, token_id: int, is_special: bool) -> str:
+    """Decode token, handling special tokens appropriately."""
+    if is_special:
+        return tokenizer.convert_ids_to_tokens([token_id])[0]
+    return tokenizer.decode([token_id])
 
 
-def get_context_boundary(token_ids: List[int], context_ids: List[int], special_mask: List[int]) -> int:
-    """Get last index of context tokens. Returns -1 if no context or not found."""
-    if not context_ids:
-        return -1
+def prepare_input_with_context(sentence_ids: torch.Tensor, context_ids: List[int] = None) -> Tuple[torch.Tensor, int]:
+    """
+    Combine context and sentence IDs.
     
-    # Find first non-special token
-    first_content = next((i for i, is_special in enumerate(special_mask) if not is_special), 0)
+    Returns:
+        (combined_ids, sentence_start_position)
+    """
+    if context_ids:
+        input_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
+        sentence_start = len(context_ids)
+    else:
+        input_ids = sentence_ids
+        sentence_start = 0
+    return input_ids, sentence_start
+
+
+def compute_surprisal_entropy(logits: torch.Tensor, target_id: int) -> Tuple[float, float]:
+    """Compute surprisal and entropy from logits."""
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
     
-    # Find context subsequence
-    ctx_start = find_token_subsequence(token_ids, context_ids, start=first_content)
-    if ctx_start == -1:
-        return -1
+    surprisal = -log_probs[target_id].item() / LN2
+    entropy = -(probs * log_probs).sum().item() / LN2
     
-    return ctx_start + len(context_ids) - 1
+    return surprisal, entropy
+
+
+def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
+    """Get top-k most probable tokens from logits."""
+    probs = torch.softmax(logits, dim=-1)
+    top_k_probs, top_k_ids = torch.topk(probs, k=min(k, len(probs)))
+    return [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
 
 
 # ============================================================================
@@ -212,85 +226,58 @@ def score_autoregressive(
     beam_width: int = 3,
     context_ids: List[int] = None
 ) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
-    """
-    Score sentence with AR model. Returns tokens, is_special flags,
-    surprisals, entropies, and prediction columns.
-    
-    Left context is used for conditioning but NOT included in output.
-    """
-    # Tokenize sentence ONLY (no context concatenation)
+    """Score sentence with AR model."""
+    # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
     
-    if len(sentence_ids) < 1:
+    if not sentence_ids.numel():
         return [], [], [], [], []
     
-    # Get special token mask for sentence tokens only
+    # Prepare input with context
+    input_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # Prepend context IDs for model input (if context exists)
-    if context_ids:
-        # Combine context + sentence for model input
-        input_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
-        # Offset for sentence tokens in combined sequence
-        sentence_start = len(context_ids)
-    else:
-        input_ids = sentence_ids
-        sentence_start = 0
-    
-    # Get logits for combined sequence
+    # Get logits
     if len(input_ids) > 1:
         with torch.no_grad():
             logits = model(input_ids.unsqueeze(0)).logits[0]
     else:
         logits = None
     
+    # Score each token
     scored_tokens = []
     is_special_flags = []
     surprisals = []
     entropies = []
     pred_columns = []
     
-    # Score all sentence tokens
     for sent_pos in range(len(sentence_ids)):
-        # Position in combined sequence (context + sentence)
         combined_pos = sentence_start + sent_pos
-        
         target_id = sentence_ids[sent_pos].item()
         is_special = 1 if special_mask[sent_pos] else 0
         
-        # Use special token string if it's a special token, otherwise decode normally
-        if is_special:
-            token_str = tokenizer.convert_ids_to_tokens([target_id])[0]
-        else:
-            token_str = tokenizer.decode([target_id])
+        # Decode token
+        token_str = decode_token(tokenizer, target_id, is_special)
         
-        # First token: check if we can score it
+        # Score (first token can't be scored)
         if combined_pos == 0:
-            # Very first token, can't score
-            surprisal = float('nan')
-            entropy = float('nan')
+            surprisal = entropy = float('nan')
             pred_col = [''] * (1 + top_k + lookahead_n)
         else:
-            # Can be scored (has context or previous tokens)
-            pos_logits = logits[combined_pos - 1]
-            probs = torch.softmax(pos_logits, dim=-1)
-            log_probs = torch.log_softmax(pos_logits, dim=-1)
+            # Calculate surprisal and entropy
+            surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id)
             
-            surprisal = -log_probs[target_id].item() / LN2
-            entropy = -(probs * log_probs).sum().item() / LN2
+            # Get predictions
+            top_k_tokens = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
             
-            top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
-            top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
-            
-            # Lookahead from current position in combined sequence
+            # Get lookahead
             if lookahead_strategy == 'beam':
-                lookahead_tokens = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], 
-                                                         n=lookahead_n, beam_width=beam_width)
+                lookahead = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n, beam_width)
             else:
-                lookahead_tokens = greedy_lookahead(model, tokenizer, input_ids[:combined_pos + 1], n=lookahead_n)
+                lookahead = greedy_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n)
             
-            pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead_tokens
+            pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead
         
         scored_tokens.append(token_str)
         is_special_flags.append(is_special)
@@ -318,40 +305,30 @@ def score_masked_lm(
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
     
-    # Tokenize sentence ONLY (no context concatenation)
+    # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
     
-    if len(sentence_ids) < 1:
+    if not sentence_ids.numel():
         return [], [], [], [], []
     
-    # Get special token mask for sentence tokens only
+    # Prepare input with context
+    base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # Prepend context IDs for model input (if context exists)
-    if context_ids:
-        # Combine context + sentence for model input
-        base_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
-        # Offset for sentence tokens in combined sequence
-        sentence_start = len(context_ids)
-    else:
-        base_ids = sentence_ids
-        sentence_start = 0
-    
+    # Score each token
     scored_tokens = []
     is_special_flags = []
     surprisals = []
     entropies = []
     pred_columns = []
     
-    # Score all sentence tokens
     for sent_pos in range(len(sentence_ids)):
-        # Position in combined sequence (context + sentence)
         combined_pos = sentence_start + sent_pos
-        
+        target_id = sentence_ids[sent_pos].item()
         is_special = 1 if special_mask[sent_pos] else 0
         
-        # Mask current position in combined sequence
+        # Mask current position
         masked_ids = base_ids.clone()
         masked_ids[combined_pos] = tokenizer.mask_token_id
         
@@ -359,24 +336,15 @@ def score_masked_lm(
         with torch.no_grad():
             logits = model(masked_ids.unsqueeze(0)).logits[0, combined_pos]
         
-        probs = torch.softmax(logits, dim=-1)
-        log_probs = torch.log_softmax(logits, dim=-1)
+        # Calculate surprisal and entropy
+        surprisal, entropy = compute_surprisal_entropy(logits, target_id)
         
-        actual_id = sentence_ids[sent_pos].item()
-        surprisal = -log_probs[actual_id].item() / LN2
-        entropy = -(probs * log_probs).sum().item() / LN2
-        
-        # Top-k predictions
-        top_k_probs, top_k_ids = torch.topk(probs, k=min(top_k, len(probs)))
-        top_k_tokens = [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
-        
+        # Get top-k predictions
+        top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
         pred_col = [top_k_tokens[0]] + top_k_tokens
         
-        # Use special token string if it's a special token, otherwise decode normally
-        if is_special:
-            token_str = tokenizer.convert_ids_to_tokens([actual_id])[0]
-        else:
-            token_str = tokenizer.decode([actual_id])
+        # Decode token
+        token_str = decode_token(tokenizer, target_id, is_special)
         
         scored_tokens.append(token_str)
         is_special_flags.append(is_special)
