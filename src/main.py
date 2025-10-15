@@ -238,12 +238,10 @@ def score_autoregressive(
     input_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # Get logits
-    if len(input_ids) > 1:
-        with torch.no_grad():
-            logits = model(input_ids.unsqueeze(0)).logits[0]
-    else:
-        logits = None
+    # Get logits for the full sequence
+    with torch.no_grad():
+        outputs = model(input_ids.unsqueeze(0))
+        logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
     
     # Score each token
     scored_tokens = []
@@ -260,22 +258,63 @@ def score_autoregressive(
         # Decode token
         token_str = decode_token(tokenizer, target_id, is_special)
         
-        # Score (first token can't be scored)
+        # Score based on position
         if combined_pos == 0:
-            surprisal = entropy = float('nan')
-            pred_col = [''] * (1 + top_k + lookahead_n)
+            # First token with no context: use unconditional distribution
+            # This is p(token | start_of_sequence)
+            # For most AR models, this is the distribution after BOS/empty prompt
+            
+            # We can't condition on anything, so we use the model's implicit
+            # prior distribution. We'll use a minimal input to get this.
+            with torch.no_grad():
+                # Get logits for empty/minimal context
+                # Some models need at least BOS token, others work with empty
+                if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
+                    # Use BOS token as minimal context
+                    minimal_input = torch.tensor([[tokenizer.bos_token_id]])
+                    minimal_logits = model(minimal_input).logits[0, -1]
+                else:
+                    # No BOS - use the first position logits from current forward pass
+                    # This represents p(first_token | empty_context)
+                    minimal_logits = logits[0] if len(logits) > 0 else None
+            
+            if minimal_logits is not None:
+                # Calculate surprisal and entropy
+                surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
+                
+                # Get predictions
+                top_k_tokens = get_top_k_predictions(minimal_logits, tokenizer, top_k)
+                
+                # Get lookahead (from current first token)
+                if lookahead_n > 0:
+                    if lookahead_strategy == 'beam':
+                        lookahead = beam_search_lookahead(model, tokenizer, input_ids[:1], lookahead_n, beam_width)
+                    else:
+                        lookahead = greedy_lookahead(model, tokenizer, input_ids[:1], lookahead_n)
+                else:
+                    lookahead = []
+                
+                pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead
+            else:
+                # Fallback if we can't get minimal logits
+                surprisal = entropy = float('nan')
+                pred_col = [''] * (1 + top_k + lookahead_n)
+        
         else:
-            # Calculate surprisal and entropy
+            # Regular token: use previous position's logits
             surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id)
             
             # Get predictions
             top_k_tokens = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
             
             # Get lookahead
-            if lookahead_strategy == 'beam':
-                lookahead = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n, beam_width)
+            if lookahead_n > 0:
+                if lookahead_strategy == 'beam':
+                    lookahead = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n, beam_width)
+                else:
+                    lookahead = greedy_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n)
             else:
-                lookahead = greedy_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n)
+                lookahead = []
             
             pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead
         
