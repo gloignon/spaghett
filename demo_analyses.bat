@@ -7,7 +7,7 @@ cd /d "%~dp0"
 
 if not exist "out" mkdir "out"
 
-echo ===== Run 1: Without left context =====
+echo ===== Run 1: AR without left context (beam)=====
 python -u "src\main.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --output_file "out\demo_sentences_nocontext.tsv" ^
@@ -24,7 +24,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo ===== Run 2: With left context =====
+echo ===== Run 2: AR with left context (beam) =====
 python -u "src\main.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --output_file "out\demo_sentences_withcontext.tsv" ^
@@ -36,13 +36,26 @@ python -u "src\main.py" ^
   --model "lightonai/pagnol-small" ^
   --format "sentences"
 
+echo.
+echo ===== Run 3: Masked token =====
+python -u "src\main.py" ^
+  --input_file "in\demo_sentences.tsv" ^
+  --output_file "out\demo_sentences_mlm.tsv" ^
+  --left_context_file "in\demo_context.txt" ^
+  --top_k 3 ^
+  --mode "mlm" ^
+  --model "almanach/camembert-base" ^
+  --format "sentences"
+
 if %ERRORLEVEL% EQU 0 (
   echo.
   echo All runs completed successfully!
-  echo - No context: "out\demo_sentences_nocontext.tsv"
-  echo - With context: "out\demo_sentences_withcontext.tsv"
+  echo - AR, No context: "out\demo_sentences_nocontext.tsv"
+  echo - AR with context: "out\demo_sentences_withcontext.tsv"
+  echo - demo_sentences_mlm: "out\demo_sentences_mlm.tsv"
 ) else (
   echo Run 2 failed with exit code %ERRORLEVEL%
 )
+
 
 exit /b %ERRORLEVEL%

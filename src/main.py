@@ -70,7 +70,7 @@ Output TSV columns:
         Useful for understanding what word/phrase the model expects to follow.
 
 Notes:
-    - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc).
+    - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc) when the model produces them.
     - First token in AR mode has empty surprisal/entropy (no prior context).
     - Users can filter rows using is_special columns in post-processing.
     - Surprisal and entropy are in bits (log base 2) for interpretability.
@@ -162,7 +162,7 @@ def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List
     
     return lookahead
 
-
+# This will be find the most probable sequence of n tokens (forming a word) using beam search
 def beam_search_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int, beam_width: int = 3) -> List[str]:
     """Generate n tokens using beam search and return the best sequence."""
     if n <= 0:
@@ -209,7 +209,8 @@ def score_autoregressive(
     top_k: int = 5,
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
-    beam_width: int = 3
+    beam_width: int = 3,
+    context_ids: List[int] = None
 ) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
     """
     Score sentence with AR model. Returns tokens, is_special flags,
@@ -226,8 +227,14 @@ def score_autoregressive(
     
     # Get context boundary and special token mask
     special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
-    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    if context_ids is None:
+        context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    
+    # ONLY compute logits if we have sentence tokens to score (after context)
+    if ctx_last >= len(input_ids) - 1:
+        # All tokens are context, nothing to score
+        return [], [], [], [], []
     
     # Get logits
     if len(input_ids) > 1:
@@ -242,17 +249,12 @@ def score_autoregressive(
     entropies = []
     pred_columns = []
     
-    # Process all tokens starting from index 0
-    for pos in range(len(input_ids)):
+    # START from first sentence token (skip context entirely)
+    start_pos = ctx_last + 1 if ctx_last >= 0 else 0
+    
+    for pos in range(start_pos, len(input_ids)):
         target_id = input_ids[pos].item()
-        
-        # Track flags
         is_special = 1 if special_mask[pos] else 0
-        is_context = pos <= ctx_last
-        
-        # SKIP context tokens - don't add them to output
-        if is_context:
-            continue
         
         # Use special token string if it's a special token, otherwise decode normally
         if is_special:
@@ -260,10 +262,10 @@ def score_autoregressive(
         else:
             token_str = tokenizer.decode([target_id])
         
-        # For position 0 (or first sentence token after context), check if we can score it
-        if pos == 0 or (ctx_last >= 0 and pos == ctx_last + 1):
-            # If it's the very first token overall, can't score
+        # For first sentence token, check if we can score it
+        if pos == start_pos:
             if pos == 0:
+                # Very first token overall, can't score
                 surprisal = float('nan')
                 entropy = float('nan')
                 pred_col = [''] * (1 + top_k + lookahead_n)
@@ -320,7 +322,8 @@ def score_masked_lm(
     left_context: str,
     tokenizer,
     model,
-    top_k: int = 5
+    top_k: int = 5,
+    context_ids: List[int] = None
 ) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
     """
     Score sentence with MLM. Returns tokens, is_special flags,
@@ -335,13 +338,19 @@ def score_masked_lm(
     encoding = tokenizer(combined, return_tensors="pt", add_special_tokens=True)
     input_ids = encoding["input_ids"][0]
     
-    if len(input_ids) < 2:
+    if len(input_ids) < 1:
         return [], [], [], [], []
     
     # Get context boundary and special token mask
     special_mask = tokenizer.get_special_tokens_mask(input_ids.tolist(), already_has_special_tokens=True)
-    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    if context_ids is None:
+        context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     ctx_last = get_context_boundary(input_ids.tolist(), context_ids, special_mask)
+    
+    # ONLY process sentence tokens (skip context entirely)
+    if ctx_last >= len(input_ids) - 1:
+        # All tokens are context, nothing to score
+        return [], [], [], [], []
     
     scored_tokens = []
     is_special_flags = []
@@ -349,14 +358,11 @@ def score_masked_lm(
     entropies = []
     pred_columns = []
     
-    for pos in range(len(input_ids)):
-        # Track flags
+    # START from first sentence token
+    start_pos = ctx_last + 1 if ctx_last >= 0 else 0
+    
+    for pos in range(start_pos, len(input_ids)):
         is_special = 1 if special_mask[pos] else 0
-        is_context = pos <= ctx_last
-        
-        # SKIP context tokens - don't add them to output
-        if is_context:
-            continue
         
         # Mask current position
         masked_ids = input_ids.clone()
@@ -477,15 +483,18 @@ def main():
     print(f"Loading {args.mode.upper()} model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     
+    # PRE-TOKENIZE CONTEXT ONCE
+    context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
+    
     if args.mode == 'ar':
         model = AutoModelForCausalLM.from_pretrained(args.model)
         score_fn = lambda s: score_autoregressive(
             s, left_context, tokenizer, model, args.top_k, args.lookahead_n, 
-            args.lookahead_strategy, args.beam_width
+            args.lookahead_strategy, args.beam_width, context_ids  # PASS PRE-TOKENIZED
         )
     else:
         model = AutoModelForMaskedLM.from_pretrained(args.model)
-        score_fn = lambda s: score_masked_lm(s, left_context, tokenizer, model, args.top_k)
+        score_fn = lambda s: score_masked_lm(s, left_context, tokenizer, model, args.top_k, context_ids)  # PASS PRE-TOKENIZED
     
     model.eval()
     
