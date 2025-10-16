@@ -51,13 +51,9 @@ Output TSV columns:
         Empty for first token in AR mode.
         Range: 0 (completely certain) to log2(vocab_size) (uniform distribution).
     
-    pred_top (str): 
-        The most probable token predicted by the model at this position.
-        AR mode: most probable next token given context up to current position.
-        MLM mode: most probable token for masked position given bidirectional context.
-    
-    top_k_1 through top_k_N (str): 
-        The top-k most probable tokens, ranked by probability (1=highest).
+    pred_alt_1 through pred_alt_N (str): 
+        The N most probable tokens the model predicted would appear (instead of the current token), 
+        ranked by probability (1=highest).
         Number of columns determined by --top_k parameter.
         Useful for analyzing alternative predictions and model confidence.
     
@@ -71,10 +67,10 @@ Output TSV columns:
 
 Notes:
     - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc) when the model produces them.
-    - First token in AR mode has empty surprisal/entropy (no prior context).
-    - Users can filter rows using is_special columns in post-processing.
+    - In AR mode we also compute surprisal and entropy for the fist token if no prior context is provided. Filter out if undesired.
+    - Don't want special tokens? You can filter them out easily using the is_special column in post-processing.
     - Surprisal and entropy are in bits (log base 2) for interpretability.
-    - Designed for simplicity and robustness over performance (no batching, no GPU acceleration).
+    - Designed for simplicity and robustness over performance (limited batching, no GPU acceleration).
 """
 
 import argparse
@@ -127,7 +123,7 @@ def prepare_input_with_context(sentence_ids: torch.Tensor, context_ids: List[int
     Returns:
         (combined_ids, sentence_start_position)
     """
-    if context_ids:
+    if context_ids is not None and len(context_ids) > 0:
         input_ids = torch.cat([torch.tensor(context_ids), sentence_ids])
         sentence_start = len(context_ids)
     else:
@@ -226,7 +222,17 @@ def score_autoregressive(
     beam_width: int = 3,
     context_ids: List[int] = None
 ) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
-    """Score sentence with AR model."""
+    """
+    Score sentence with AR model.
+
+    Returns:
+        Tuple containing:
+            - List[str]: Decoded tokens for the sentence.
+            - List[int]: Flags indicating if each token is a special token (1) or not (0).
+            - List[float]: Surprisal values (in bits) for each token.
+            - List[float]: Entropy values (in bits) for each token.
+            - List[List[str]]: For each token, a list containing the most probable token, top-k predictions, and lookahead tokens.
+    """
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
@@ -294,7 +300,7 @@ def score_autoregressive(
                 else:
                     lookahead = []
                 
-                pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead
+                pred_col = top_k_tokens + lookahead
             else:
                 # Fallback if we can't get minimal logits
                 surprisal = entropy = float('nan')
@@ -316,7 +322,7 @@ def score_autoregressive(
             else:
                 lookahead = []
             
-            pred_col = [top_k_tokens[0]] + top_k_tokens + lookahead
+            pred_col = top_k_tokens + lookahead
         
         scored_tokens.append(token_str)
         is_special_flags.append(is_special)
@@ -329,15 +335,16 @@ def score_autoregressive(
 
 def score_masked_lm(
     sentence: str,
-    left_context: str,
     tokenizer,
     model,
     top_k: int = 5,
     context_ids: List[int] = None
 ) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
     """
-    Score sentence with MLM. Returns tokens, is_special flags,
-    surprisals, entropies, and prediction columns.
+    Score sentence with MLM using parallel masking.
+    
+    Instead of N forward passes (one per token), we do ONE forward pass
+    with all masked positions batched together. This should be faster.
     
     Left context is used for conditioning but NOT included in output.
     """
@@ -355,32 +362,46 @@ def score_masked_lm(
     base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # Score each token
+    num_tokens = len(sentence_ids)
+    
+    # Create ALL masked versions at once
+    masked_batch = []
+    for sent_pos in range(num_tokens):
+        combined_pos = sentence_start + sent_pos
+        masked_ids = base_ids.clone()
+        masked_ids[combined_pos] = tokenizer.mask_token_id
+        masked_batch.append(masked_ids)
+    
+    # Stack into batch: (num_tokens, seq_len)
+    masked_batch = torch.stack(masked_batch)
+    
+    # ONE forward pass for all masked positions!
+    with torch.no_grad():
+        outputs = model(masked_batch)
+        all_logits = outputs.logits  # (num_tokens, seq_len, vocab_size)
+    
+    # Extract logits for each masked position and score
     scored_tokens = []
     is_special_flags = []
     surprisals = []
     entropies = []
     pred_columns = []
     
-    for sent_pos in range(len(sentence_ids)):
+    for sent_pos in range(num_tokens):
         combined_pos = sentence_start + sent_pos
         target_id = sentence_ids[sent_pos].item()
         is_special = 1 if special_mask[sent_pos] else 0
         
-        # Mask current position
-        masked_ids = base_ids.clone()
-        masked_ids[combined_pos] = tokenizer.mask_token_id
-        
-        # Get predictions
-        with torch.no_grad():
-            logits = model(masked_ids.unsqueeze(0)).logits[0, combined_pos]
+        # Get logits for this token's masked position
+        logits = all_logits[sent_pos, combined_pos]
         
         # Calculate surprisal and entropy
         surprisal, entropy = compute_surprisal_entropy(logits, target_id)
         
         # Get top-k predictions
         top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
-        pred_col = [top_k_tokens[0]] + top_k_tokens
+        # pred_col = [top_k_tokens[0]] + top_k_tokens
+        pred_col = top_k_tokens
         
         # Decode token
         token_str = decode_token(tokenizer, target_id, is_special)
@@ -433,19 +454,17 @@ def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n:
     if not results:
         return
     
-    # Build header (removed is_context)
-    base_cols = ['doc_id', 'sentence_id', 'token_index', 'token', 'is_special', 
-                 'surprisal_bits', 'entropy_bits', 'pred_top']
-    top_k_cols = [f'top_k_{i}' for i in range(1, top_k + 1)]
+    # Build column names
+    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'is_special', 
+               'surprisal_bits', 'entropy_bits']
+    
+    columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
     
     if mode == 'ar':
-        lookahead_cols = [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
-        header = base_cols + top_k_cols + lookahead_cols
-    else:
-        header = base_cols + top_k_cols
+        columns += [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
     
     with open(output_file, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=header, delimiter='\t')
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter='\t')
         writer.writeheader()
         writer.writerows(results)
 
@@ -513,7 +532,7 @@ def process_sentences(
         )
     elif mode == 'mlm':
         model = AutoModelForMaskedLM.from_pretrained(model_name)
-        score_fn = lambda s: score_masked_lm(s, left_context, tokenizer, model, top_k, context_ids)
+        score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
     
@@ -538,17 +557,16 @@ def process_sentences(
                 'token': token,
                 'is_special': is_special,
                 'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
-                'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}',
-                'pred_top': preds[0] if preds else ''
+                'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
             }
             
             # Add top-k columns
             for i in range(1, top_k + 1):
-                row[f'top_k_{i}'] = preds[i] if i < len(preds) else ''
+                row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
             
             # Add lookahead columns (AR only)
             if mode == 'ar':
-                offset = top_k + 1
+                offset = top_k
                 for i in range(1, lookahead_n + 1):
                     row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
             
