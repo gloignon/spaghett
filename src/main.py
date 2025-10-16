@@ -69,12 +69,15 @@ Output TSV columns:
         Useful for understanding what word/phrase the model expects to follow.
 
 Notes:
+    - The general philosophy is "fix it in post-processing" rather than complicating the scoring code.
     - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc) when the model produces them.
     - In AR mode we also compute surprisal and entropy for the fist token if no prior context is provided. Filter out if undesired.
-    - Don't want special tokens? You can filter them out easily using the is_special column in post-processing.
-    - Surprisal and entropy are in bits (log base 2) for interpretability.
+    - Don't want special tokens? You can also filter them out easily using the is_special column in post-processing.
     - We avoid making assumptions about special characters in tokenization (e.g., "Ġ" vs "▁") and output both raw and decoded forms.
     - Designed for simplicity and robustness over performance (limited batching, no GPU acceleration).
+    - Surprisal and entropy are in bits (log base 2).
+    - For MLM, we use parallel masking (one forward pass with all tokens masked) for efficiency. AR has no batching for now.
+
 """
 
 import argparse
