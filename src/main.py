@@ -30,8 +30,11 @@ Output TSV columns:
         Position of the token within the sentence (1-indexed).
     
     token (str): 
-        The actual token text. Special tokens (BOS/EOS/CLS/SEP) shown as token symbols (e.g., '<s>', '</s>').
-    
+        The actual token text
+
+    token_decoded (str):
+        Human-readable decoded token text (e.g., "Il" instead of "▁Il" or "<s>").
+
     is_special (int): 
         Flag indicating if token is a special token (1) or regular content token (0).
         Special tokens include BOS, EOS, CLS, SEP, PAD, MASK, etc.
@@ -70,6 +73,7 @@ Notes:
     - In AR mode we also compute surprisal and entropy for the fist token if no prior context is provided. Filter out if undesired.
     - Don't want special tokens? You can filter them out easily using the is_special column in post-processing.
     - Surprisal and entropy are in bits (log base 2) for interpretability.
+    - We avoid making assumptions about special characters in tokenization (e.g., "Ġ" vs "▁") and output both raw and decoded forms.
     - Designed for simplicity and robustness over performance (limited batching, no GPU acceleration).
 """
 
@@ -109,11 +113,21 @@ def combine_context_and_sentence(context: str, sentence: str) -> str:
     return context or sentence
 
 
-def decode_token(tokenizer, token_id: int, is_special: bool) -> str:
-    """Decode token, handling special tokens appropriately."""
+def decode_token(tokenizer, token_id: int, is_special: bool) -> Tuple[str, str]:
+    """
+    Decode token, returning both raw and human-readable forms.
+    
+    Returns:
+        (raw_token, decoded_token) where:
+        - raw_token: token as model outputs it (e.g., "▁Il", "ĠIl", "<s>")
+        - decoded_token: human-readable form (e.g., "Il", "Il", "<s>")
+    """
+    raw_token = tokenizer.convert_ids_to_tokens([token_id])[0]
     if is_special:
-        return tokenizer.convert_ids_to_tokens([token_id])[0]
-    return tokenizer.decode([token_id])
+        decoded_token = raw_token  # Special tokens are already readable
+    else:
+        decoded_token = tokenizer.decode([token_id])
+    return raw_token, decoded_token
 
 
 def prepare_input_with_context(sentence_ids: torch.Tensor, context_ids: List[int] = None) -> Tuple[torch.Tensor, int]:
@@ -221,13 +235,14 @@ def score_autoregressive(
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
     context_ids: List[int] = None
-) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
     """
     Score sentence with AR model.
 
     Returns:
         Tuple containing:
-            - List[str]: Decoded tokens for the sentence.
+            - List[str]: Raw tokens as model outputs them.
+            - List[str]: Decoded tokens (human-readable).
             - List[int]: Flags indicating if each token is a special token (1) or not (0).
             - List[float]: Surprisal values (in bits) for each token.
             - List[float]: Entropy values (in bits) for each token.
@@ -238,7 +253,7 @@ def score_autoregressive(
     sentence_ids = encoding["input_ids"][0]
     
     if not sentence_ids.numel():
-        return [], [], [], [], []
+        return [], [], [], [], [], []
     
     # Prepare input with context
     input_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
@@ -250,6 +265,7 @@ def score_autoregressive(
         logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
     
     # Score each token
+    raw_tokens = []
     scored_tokens = []
     is_special_flags = []
     surprisals = []
@@ -261,37 +277,23 @@ def score_autoregressive(
         target_id = sentence_ids[sent_pos].item()
         is_special = 1 if special_mask[sent_pos] else 0
         
-        # Decode token
-        token_str = decode_token(tokenizer, target_id, is_special)
+        # Decode token (both raw and readable)
+        raw_token, token_str = decode_token(tokenizer, target_id, is_special)
         
         # Score based on position
         if combined_pos == 0:
             # First token with no context: use unconditional distribution
-            # This is p(token | start_of_sequence)
-            # For most AR models, this is the distribution after BOS/empty prompt
-            
-            # We can't condition on anything, so we use the model's implicit
-            # prior distribution. We'll use a minimal input to get this.
             with torch.no_grad():
-                # Get logits for empty/minimal context
-                # Some models need at least BOS token, others work with empty
                 if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
-                    # Use BOS token as minimal context
                     minimal_input = torch.tensor([[tokenizer.bos_token_id]])
                     minimal_logits = model(minimal_input).logits[0, -1]
                 else:
-                    # No BOS - use the first position logits from current forward pass
-                    # This represents p(first_token | empty_context)
                     minimal_logits = logits[0] if len(logits) > 0 else None
             
             if minimal_logits is not None:
-                # Calculate surprisal and entropy
                 surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
-                
-                # Get predictions
                 top_k_tokens = get_top_k_predictions(minimal_logits, tokenizer, top_k)
                 
-                # Get lookahead (from current first token)
                 if lookahead_n > 0:
                     if lookahead_strategy == 'beam':
                         lookahead = beam_search_lookahead(model, tokenizer, input_ids[:1], lookahead_n, beam_width)
@@ -302,18 +304,14 @@ def score_autoregressive(
                 
                 pred_col = top_k_tokens + lookahead
             else:
-                # Fallback if we can't get minimal logits
                 surprisal = entropy = float('nan')
                 pred_col = [''] * (1 + top_k + lookahead_n)
         
         else:
             # Regular token: use previous position's logits
             surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id)
-            
-            # Get predictions
             top_k_tokens = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
             
-            # Get lookahead
             if lookahead_n > 0:
                 if lookahead_strategy == 'beam':
                     lookahead = beam_search_lookahead(model, tokenizer, input_ids[:combined_pos + 1], lookahead_n, beam_width)
@@ -324,13 +322,14 @@ def score_autoregressive(
             
             pred_col = top_k_tokens + lookahead
         
+        raw_tokens.append(raw_token)
         scored_tokens.append(token_str)
         is_special_flags.append(is_special)
         surprisals.append(surprisal)
         entropies.append(entropy)
         pred_columns.append(pred_col)
     
-    return scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
 
 
 def score_masked_lm(
@@ -339,7 +338,7 @@ def score_masked_lm(
     model,
     top_k: int = 5,
     context_ids: List[int] = None
-) -> Tuple[List[str], List[int], List[float], List[float], List[List[str]]]:
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
     """
     Score sentence with MLM using parallel masking.
     
@@ -356,7 +355,7 @@ def score_masked_lm(
     sentence_ids = encoding["input_ids"][0]
     
     if not sentence_ids.numel():
-        return [], [], [], [], []
+        return [], [], [], [], [], []
     
     # Prepare input with context
     base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
@@ -381,6 +380,7 @@ def score_masked_lm(
         all_logits = outputs.logits  # (num_tokens, seq_len, vocab_size)
     
     # Extract logits for each masked position and score
+    raw_tokens = []
     scored_tokens = []
     is_special_flags = []
     surprisals = []
@@ -400,19 +400,19 @@ def score_masked_lm(
         
         # Get top-k predictions
         top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
-        # pred_col = [top_k_tokens[0]] + top_k_tokens
         pred_col = top_k_tokens
         
-        # Decode token
-        token_str = decode_token(tokenizer, target_id, is_special)
+        # Decode token (both raw and readable)
+        raw_token, token_str = decode_token(tokenizer, target_id, is_special)
         
+        raw_tokens.append(raw_token)
         scored_tokens.append(token_str)
         is_special_flags.append(is_special)
         surprisals.append(surprisal)
         entropies.append(entropy)
         pred_columns.append(pred_col)
     
-    return scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
 
 
 # ============================================================================
@@ -455,7 +455,7 @@ def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n:
         return
     
     # Build column names
-    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'is_special', 
+    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special', 
                'surprisal_bits', 'entropy_bits']
     
     columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
@@ -545,16 +545,17 @@ def process_sentences(
         iterator = tqdm(iterator, total=len(sentences), desc="Processing")
     
     for doc_id, sent_id, sentence in iterator:
-        tokens, is_special_flags, surprisals, entropies, pred_cols = score_fn(sentence)
+        raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols = score_fn(sentence)
         
-        for idx, (token, is_special, surp, ent, preds) in enumerate(
-            zip(tokens, is_special_flags, surprisals, entropies, pred_cols), 1
+        for idx, (raw_token, token, is_special, surp, ent, preds) in enumerate(
+            zip(raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols), 1
         ):
             row = {
                 'doc_id': doc_id,
                 'sentence_id': sent_id,
                 'token_index': idx,
-                'token': token,
+                'token': raw_token,
+                'token_decoded': token,
                 'is_special': is_special,
                 'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
                 'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
