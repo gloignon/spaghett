@@ -158,10 +158,17 @@ def compute_surprisal_entropy(logits: torch.Tensor, target_id: int) -> Tuple[flo
 
 
 def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
-    """Get top-k most probable tokens from logits."""
+    """
+    Get the top-k most probable tokens.
+    Returns raw tokens with special characters preserved.
+    """
     probs = torch.softmax(logits, dim=-1)
-    top_k_probs, top_k_ids = torch.topk(probs, k=min(k, len(probs)))
-    return [tokenizer.decode([tid]) for tid in top_k_ids.tolist()]
+    top_probs, top_ids = torch.topk(probs, k)
+    
+    # Use convert_ids_to_tokens to preserve special characters
+    top_tokens = tokenizer.convert_ids_to_tokens(top_ids.tolist())
+    
+    return top_tokens
 
 
 # ============================================================================
@@ -169,56 +176,58 @@ def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
 # ============================================================================
 
 def greedy_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int) -> List[str]:
-    """Generate n greedy next tokens from prefix."""
-    if n <= 0:
-        return []
-    
+    """
+    Generate n tokens greedily (argmax at each step).
+    Returns raw tokens with special characters preserved.
+    """
     current = prefix_ids.clone()
-    lookahead = []
+    tokens = []
     
     for _ in range(n):
         with torch.no_grad():
-            logits = model(current.unsqueeze(0)).logits[0, -1]
+            outputs = model(current.unsqueeze(0))
+            logits = outputs.logits[0, -1]
         
         next_id = logits.argmax().item()
-        lookahead.append(tokenizer.decode([next_id]))
+        # Use convert_ids_to_tokens to preserve special characters
+        token_str = tokenizer.convert_ids_to_tokens([next_id])[0]
+        tokens.append(token_str)
+        
         current = torch.cat([current, torch.tensor([next_id])])
     
-    return lookahead
+    return tokens
 
-# This will be find the most probable sequence of n tokens (forming a word) using beam search
+
 def beam_search_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int, beam_width: int = 3) -> List[str]:
-    """Generate n tokens using beam search and return the best sequence."""
-    if n <= 0:
-        return []
-    
-    # Initialize beams: [(sequence, cumulative_log_prob)]
-    beams = [(prefix_ids.clone(), 0.0)]
+    """
+    Generate n tokens using beam search.
+    Returns raw tokens with special characters preserved.
+    """
+    beams = [(prefix_ids.clone(), 0.0, [])]
     
     for step in range(n):
         candidates = []
         
-        for seq, score in beams:
+        for current_ids, current_score, current_tokens in beams:
             with torch.no_grad():
-                logits = model(seq.unsqueeze(0)).logits[0, -1]
+                outputs = model(current_ids.unsqueeze(0))
+                logits = outputs.logits[0, -1]
             
             log_probs = torch.log_softmax(logits, dim=-1)
+            top_log_probs, top_ids = torch.topk(log_probs, beam_width)
             
-            # Get top beam_width candidates
-            top_log_probs, top_ids = torch.topk(log_probs, k=min(beam_width, len(log_probs)))
-            
-            for log_prob, token_id in zip(top_log_probs.tolist(), top_ids.tolist()):
-                new_seq = torch.cat([seq, torch.tensor([token_id])])
-                new_score = score + log_prob
-                candidates.append((new_seq, new_score))
+            for log_prob, token_id in zip(top_log_probs, top_ids):
+                new_score = current_score + log_prob.item()
+                new_ids = torch.cat([current_ids, token_id.unsqueeze(0)])
+                # Use convert_ids_to_tokens to preserve special characters
+                token_str = tokenizer.convert_ids_to_tokens([token_id.item()])[0]
+                new_tokens = current_tokens + [token_str]
+                candidates.append((new_ids, new_score, new_tokens))
         
-        # Keep top beam_width sequences
         beams = sorted(candidates, key=lambda x: x[1], reverse=True)[:beam_width]
     
-    # Return best sequence (excluding prefix)
-    best_seq = beams[0][0]
-    lookahead_ids = best_seq[len(prefix_ids):].tolist()
-    return [tokenizer.decode([tid]) for tid in lookahead_ids]
+    best_beam = beams[0]
+    return best_beam[2]
 
 
 # ============================================================================
