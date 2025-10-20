@@ -11,3 +11,7 @@ protobuf>=3.20.0
 
 # Small helper for newer typing features on older Pythons (optional)
 typing-extensions>=4.0.0
+
+# Will only need if you want to run comparisons with minicons,
+# Such as the tests provided in test/test_minicons_compare.py
+minicons>=0.3

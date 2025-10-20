@@ -5,7 +5,7 @@ import os
 from typing import List, Tuple
 import numpy as np
 
-# Add src directory to path before importing main
+# Add src directory to path before importing scorer
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 # Verbose printing control (on by default). Set SPAGHETT_VERBOSE=0 to silence tables.
@@ -15,7 +15,7 @@ VERBOSE = os.getenv("SPAGHETT_VERBOSE", "1") == "1"
 """
 test_minicons_compare.py
 
-Test that surprisal values from main.py match those from the minicons library.
+Test that surprisal values from scorer.py match those from the minicons library.
 
 Usage:
     python -m pytest test_minicons_compare.py -v
@@ -28,7 +28,7 @@ Usage:
 TEST_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
     "This is a short test sentence.",
-    "Minicons surprisal should be comparable to main.py output.",
+    "Minicons surprisal should be comparable to scorer.py output.",
 ]
 
 THRESHOLD = 0.1  # Maximum allowed difference in bits
@@ -38,9 +38,9 @@ PLL_METRIC = "original"
 PLL_METRICS = ["original", "within_word_l2r"]
 
 
-def compute_with_main(texts: List[str], model_name: str, mode: str, pll_metric: str = 'original') -> List[Tuple[List[str], List[float]]]:
+def compute_with_scorer(texts: List[str], model_name: str, mode: str, pll_metric: str = 'original') -> List[Tuple[List[str], List[float]]]:
     """
-    Compute surprisal using main.py's process_sentences function.
+    Compute surprisal using scorer.py's process_sentences function.
     
     Returns:
         List of (tokens, surprisals) tuples, one per text
@@ -48,18 +48,18 @@ def compute_with_main(texts: List[str], model_name: str, mode: str, pll_metric: 
     import importlib
     
     try:
-        main = importlib.import_module("main")
+        scorer = importlib.import_module("scorer")
     except Exception as e:
-        raise RuntimeError(f"Failed to import main.py: {e}")
+        raise RuntimeError(f"Failed to import scorer.py: {e}")
     
-    if not hasattr(main, "process_sentences"):
+    if not hasattr(scorer, "process_sentences"):
         raise RuntimeError(
-            "main.py does not export process_sentences(). "
-            "Please ensure your main.py has this function."
+            "scorer.py does not export process_sentences(). "
+            "Please ensure your scorer.py has this function."
         )
     
     # Call process_sentences
-    results = main.process_sentences(
+    results = scorer.process_sentences(
         sentences=texts,
         mode=mode,
         model_name=model_name,
@@ -152,7 +152,7 @@ def compute_with_minicons(texts: List[str], model_name: str, mode: str, pll_metr
             
             # In AR models, minicons returns surprisal for tokens 1..N
             # (the first token has no context, so no surprisal is computed)
-            # We need to prepend NaN for the first token to align with main.py
+            # We need to prepend NaN for the first token to align with scorer.py
             surprisal_values = [np.nan] + surprisal_values
             
             output.append((token_strings, surprisal_values))
@@ -215,7 +215,7 @@ def compute_with_minicons(texts: List[str], model_name: str, mode: str, pll_metr
 
 
 class TestMiniconsSurprisal(unittest.TestCase):
-    """Test that main.py surprisal values match minicons."""
+    """Test that scorer.py surprisal values match minicons."""
     
     @classmethod
     def setUpClass(cls):
@@ -224,59 +224,59 @@ class TestMiniconsSurprisal(unittest.TestCase):
         print(f"AR model: {AR_MODEL}")
         print(f"MLM model: {MLM_MODEL}")
     
-    def _print_table(self, text_idx: int, tokens: List[str], main_vals: List[float], mini_vals: List[float]):
+    def _print_table(self, text_idx: int, tokens: List[str], scorer_vals: List[float], mini_vals: List[float]):
         if not VERBOSE:
             return
         print("\n" + "=" * 100)
         print(f"Text {text_idx} token-level comparison")
         print("=" * 100)
-        print(f"{'Idx':<4} {'Token':<24} {'main.py (bits)':>16} {'minicons (bits)':>17} {'Diff':>10}  Status")
+        print(f"{'Idx':<4} {'Token':<24} {'scorer.py (bits)':>16} {'minicons (bits)':>17} {'Diff':>10}  Status")
         print("-" * 100)
-        for j, (tok, ms, mcs) in enumerate(zip(tokens, main_vals, mini_vals)):
-            ms_str = "NaN" if np.isnan(ms) else f"{ms:.4f}"
+        for j, (tok, ss, mcs) in enumerate(zip(tokens, scorer_vals, mini_vals)):
+            ss_str = "NaN" if np.isnan(ss) else f"{ss:.4f}"
             mcs_str = "NaN" if np.isnan(mcs) else f"{mcs:.4f}"
-            if np.isnan(ms) or np.isnan(mcs):
+            if np.isnan(ss) or np.isnan(mcs):
                 diff_str = "N/A"
                 status = "- SKIP"
             else:
-                diff = abs(ms - mcs)
+                diff = abs(ss - mcs)
                 diff_str = f"{diff:.4f}"
                 status = "✓ OK" if diff <= THRESHOLD else "✗ FAIL"
             disp_tok = tok if len(tok) <= 22 else tok[:20] + ".."
-            print(f"{j:<4} {disp_tok:<24} {ms_str:>16} {mcs_str:>17} {diff_str:>10}  {status}")
+            print(f"{j:<4} {disp_tok:<24} {ss_str:>16} {mcs_str:>17} {diff_str:>10}  {status}")
         print("-" * 100)
 
-    def _compare_surprisals(self, main_results, minicons_results, model_name, mode):
+    def _compare_surprisals(self, scorer_results, minicons_results, model_name, mode):
         """Helper to compare surprisal values."""
-        for i, (main_data, minicons_data) in enumerate(zip(main_results, minicons_results)):
-            main_tokens, main_surprisals = main_data
+        for i, (scorer_data, minicons_data) in enumerate(zip(scorer_results, minicons_results)):
+            scorer_tokens, scorer_surprisals = scorer_data
             minicons_tokens, minicons_surprisals = minicons_data
             
             # Print table before assertions (helps diagnose mismatches)
-            self._print_table(i, main_tokens, main_surprisals, minicons_surprisals)
+            self._print_table(i, scorer_tokens, scorer_surprisals, minicons_surprisals)
 
             # Check token count matches
             self.assertEqual(
-                len(main_tokens), 
+                len(scorer_tokens), 
                 len(minicons_tokens),
                 f"Text {i}: Token count mismatch in {mode.upper()} mode ({model_name})"
             )
             
             # Compare token by token
-            for j, (mt, ms, mct, mcs) in enumerate(zip(
-                main_tokens, main_surprisals, minicons_tokens, minicons_surprisals
+            for j, (st, ss, mct, mcs) in enumerate(zip(
+                scorer_tokens, scorer_surprisals, minicons_tokens, minicons_surprisals
             )):
                 # Skip NaN values
-                if np.isnan(ms) or np.isnan(mcs):
+                if np.isnan(ss) or np.isnan(mcs):
                     continue
                 
-                diff = abs(ms - mcs)
+                diff = abs(ss - mcs)
                 
                 self.assertLessEqual(
                     diff,
                     THRESHOLD,
-                    f"Text {i}, token {j} '{mt}': "
-                    f"main.py={ms:.4f}, minicons={mcs:.4f}, diff={diff:.4f} "
+                    f"Text {i}, token {j} '{st}': "
+                    f"scorer.py={ss:.4f}, minicons={mcs:.4f}, diff={diff:.4f} "
                     f"exceeds threshold {THRESHOLD} in {mode.upper()} mode ({model_name})"
                 )
 
@@ -284,28 +284,28 @@ class TestMiniconsSurprisal(unittest.TestCase):
         """Test that AR model surprisal matches minicons."""
         print(f"\nTesting AR model: {AR_MODEL}")
         
-        main_results = compute_with_main(TEST_TEXTS, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(TEST_TEXTS, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(TEST_TEXTS, AR_MODEL, 'ar')
         
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR model passed")
 
     def test_mlm_model_surprisal_original(self):
         """Test that MLM (original PLL) surprisal matches minicons."""
         pll = "original"
         print(f"\nTesting MLM model ({pll}): {MLM_MODEL}")
-        main_results = compute_with_main(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        scorer_results = compute_with_scorer(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
         minicons_results = compute_with_minicons(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
         print(f"✓ MLM {pll} passed")
 
     def test_mlm_model_surprisal_l2r(self):
         """Test that MLM (within_word_l2r) surprisal matches minicons."""
         pll = "within_word_l2r"
         print(f"\nTesting MLM model ({pll}): {MLM_MODEL}")
-        main_results = compute_with_main(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        scorer_results = compute_with_scorer(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
         minicons_results = compute_with_minicons(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
         print(f"✓ MLM {pll} passed")
 
     def test_ar_empty_string(self):
@@ -313,87 +313,87 @@ class TestMiniconsSurprisal(unittest.TestCase):
         print(f"\nTesting AR model with edge case: empty string")
         empty_text = [""]
         
-        main_success = True
+        scorer_success = True
         minicons_success = True
-        main_error = None
+        scorer_error = None
         minicons_error = None
         
         try:
-            main_results = compute_with_main(empty_text, AR_MODEL, 'ar')
+            scorer_results = compute_with_scorer(empty_text, AR_MODEL, 'ar')
         except Exception as e:
-            main_success = False
-            main_error = str(e)
-            main_results = [([], [])]  # Empty result
+            scorer_success = False
+            scorer_error = str(e)
+            scorer_results = [([], [])]
         
         try:
             minicons_results = compute_with_minicons(empty_text, AR_MODEL, 'ar')
         except Exception as e:
             minicons_success = False
             minicons_error = str(e)
-            minicons_results = [([], [])]  # Empty result
+            minicons_results = [([], [])]
         
-        if not main_success:
-            print(f"⚠ main.py failed on empty string: {main_error}")
+        if not scorer_success:
+            print(f"⚠ scorer.py failed on empty string: {scorer_error}")
         if not minicons_success:
             print(f"⚠ minicons failed on empty string: {minicons_error}")
         
-        if main_success and minicons_success:
-            self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        if scorer_success and minicons_success:
+            self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
             print(f"✓ AR empty string passed")
         else:
-            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+            self.skipTest(f"Skipping comparison - scorer.py success: {scorer_success}, minicons success: {minicons_success}")
 
     def test_mlm_empty_string(self):
         """Test MLM model with empty string."""
         print(f"\nTesting MLM model with edge case: empty string")
         empty_text = [""]
         
-        main_success = True
+        scorer_success = True
         minicons_success = True
-        main_error = None
+        scorer_error = None
         minicons_error = None
         
         try:
-            main_results = compute_with_main(empty_text, MLM_MODEL, 'mlm')
+            scorer_results = compute_with_scorer(empty_text, MLM_MODEL, 'mlm')
         except Exception as e:
-            main_success = False
-            main_error = str(e)
-            main_results = [([], [])]  # Empty result
+            scorer_success = False
+            scorer_error = str(e)
+            scorer_results = [([], [])]
         
         try:
             minicons_results = compute_with_minicons(empty_text, MLM_MODEL, 'mlm')
         except Exception as e:
             minicons_success = False
             minicons_error = str(e)
-            minicons_results = [([], [])]  # Empty result
+            minicons_results = [([], [])]
         
-        if not main_success:
-            print(f"⚠ main.py failed on empty string: {main_error}")
+        if not scorer_success:
+            print(f"⚠ scorer.py failed on empty string: {scorer_error}")
         if not minicons_success:
             print(f"⚠ minicons failed on empty string: {minicons_error}")
         
-        if main_success and minicons_success:
-            self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        if scorer_success and minicons_success:
+            self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
             print(f"✓ MLM empty string passed")
         else:
-            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+            self.skipTest(f"Skipping comparison - scorer.py success: {scorer_success}, minicons success: {minicons_success}")
 
     def test_ar_single_token(self):
         """Test AR model with single token sentences."""
         print(f"\nTesting AR model with single tokens")
         single_tokens = ["Hello", "World", "!"]
-        main_results = compute_with_main(single_tokens, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(single_tokens, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(single_tokens, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR single token passed")
 
     def test_mlm_single_token(self):
         """Test MLM model with single token sentences."""
         print(f"\nTesting MLM model with single tokens")
         single_tokens = ["Hello", "World", "!"]
-        main_results = compute_with_main(single_tokens, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(single_tokens, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(single_tokens, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM single token passed")
 
     def test_ar_long_sentence(self):
@@ -404,9 +404,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "whether the implementation handles longer sequences correctly and accurately "
             "computes surprisal values for each token in the extended context window."
         ]
-        main_results = compute_with_main(long_text, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(long_text, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(long_text, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR long sentence passed")
 
     def test_mlm_long_sentence(self):
@@ -417,9 +417,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "whether the implementation handles longer sequences correctly and accurately "
             "computes surprisal values for each token in the extended context window."
         ]
-        main_results = compute_with_main(long_text, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(long_text, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(long_text, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM long sentence passed")
 
     def test_ar_special_characters(self):
@@ -431,9 +431,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Price: $100.50",
             "Email: test@example.com"
         ]
-        main_results = compute_with_main(special_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(special_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(special_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR special characters passed")
 
     def test_mlm_special_characters(self):
@@ -445,9 +445,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Price: $100.50",
             "Email: test@example.com"
         ]
-        main_results = compute_with_main(special_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(special_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(special_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM special characters passed")
 
     def test_ar_multiple_sentences_batch(self):
@@ -458,14 +458,14 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Second sentence here.",
             "Third and final sentence."
         ]
-        main_results = compute_with_main(batch_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(batch_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(batch_texts, AR_MODEL, 'ar')
         
         # Verify we got results for all sentences
-        self.assertEqual(len(main_results), len(batch_texts))
+        self.assertEqual(len(scorer_results), len(batch_texts))
         self.assertEqual(len(minicons_results), len(batch_texts))
         
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR batch processing passed")
 
     def test_mlm_multiple_sentences_batch(self):
@@ -476,14 +476,14 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Second sentence here.",
             "Third and final sentence."
         ]
-        main_results = compute_with_main(batch_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(batch_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(batch_texts, MLM_MODEL, 'mlm')
         
         # Verify we got results for all sentences
-        self.assertEqual(len(main_results), len(batch_texts))
+        self.assertEqual(len(scorer_results), len(batch_texts))
         self.assertEqual(len(minicons_results), len(batch_texts))
         
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM batch processing passed")
 
     def test_ar_whitespace_only(self):
@@ -491,17 +491,17 @@ class TestMiniconsSurprisal(unittest.TestCase):
         print(f"\nTesting AR model with whitespace strings")
         whitespace_texts = [" ", "  ", "\t", "\n"]
         
-        main_success = True
+        scorer_success = True
         minicons_success = True
-        main_error = None
+        scorer_error = None
         minicons_error = None
         
         try:
-            main_results = compute_with_main(whitespace_texts, AR_MODEL, 'ar')
+            scorer_results = compute_with_scorer(whitespace_texts, AR_MODEL, 'ar')
         except Exception as e:
-            main_success = False
-            main_error = str(e)
-            main_results = [([], [])] * len(whitespace_texts)
+            scorer_success = False
+            scorer_error = str(e)
+            scorer_results = [([], [])] * len(whitespace_texts)
         
         try:
             minicons_results = compute_with_minicons(whitespace_texts, AR_MODEL, 'ar')
@@ -510,33 +510,33 @@ class TestMiniconsSurprisal(unittest.TestCase):
             minicons_error = str(e)
             minicons_results = [([], [])] * len(whitespace_texts)
         
-        if not main_success:
-            print(f"⚠ main.py failed on whitespace strings: {main_error}")
+        if not scorer_success:
+            print(f"⚠ scorer.py failed on whitespace strings: {scorer_error}")
         if not minicons_success:
             print(f"⚠ minicons failed on whitespace strings: {minicons_error}")
         
-        if main_success and minicons_success:
-            self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        if scorer_success and minicons_success:
+            self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
             print(f"✓ AR whitespace strings passed")
         else:
-            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+            self.skipTest(f"Skipping comparison - scorer.py success: {scorer_success}, minicons success: {minicons_success}")
 
     def test_mlm_whitespace_only(self):
         """Test MLM model with whitespace-only strings."""
         print(f"\nTesting MLM model with whitespace strings")
         whitespace_texts = [" ", "  ", "\t", "\n"]
         
-        main_success = True
+        scorer_success = True
         minicons_success = True
-        main_error = None
+        scorer_error = None
         minicons_error = None
         
         try:
-            main_results = compute_with_main(whitespace_texts, MLM_MODEL, 'mlm')
+            scorer_results = compute_with_scorer(whitespace_texts, MLM_MODEL, 'mlm')
         except Exception as e:
-            main_success = False
-            main_error = str(e)
-            main_results = [([], [])] * len(whitespace_texts)
+            scorer_success = False
+            scorer_error = str(e)
+            scorer_results = [([], [])] * len(whitespace_texts)
         
         try:
             minicons_results = compute_with_minicons(whitespace_texts, MLM_MODEL, 'mlm')
@@ -545,16 +545,16 @@ class TestMiniconsSurprisal(unittest.TestCase):
             minicons_error = str(e)
             minicons_results = [([], [])] * len(whitespace_texts)
         
-        if not main_success:
-            print(f"⚠ main.py failed on whitespace strings: {main_error}")
+        if not scorer_success:
+            print(f"⚠ scorer.py failed on whitespace strings: {scorer_error}")
         if not minicons_success:
             print(f"⚠ minicons failed on whitespace strings: {minicons_error}")
         
-        if main_success and minicons_success:
-            self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        if scorer_success and minicons_success:
+            self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
             print(f"✓ MLM whitespace strings passed")
         else:
-            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+            self.skipTest(f"Skipping comparison - scorer.py success: {scorer_success}, minicons success: {minicons_success}")
 
     def test_ar_unicode_characters(self):
         """Test AR model with Unicode characters."""
@@ -565,9 +565,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Привет мир",
             "🎉 Emoji test! 🚀"
         ]
-        main_results = compute_with_main(unicode_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(unicode_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(unicode_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR Unicode characters passed")
 
     def test_mlm_unicode_characters(self):
@@ -579,9 +579,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Привет мир",
             "🎉 Emoji test! 🚀"
         ]
-        main_results = compute_with_main(unicode_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(unicode_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(unicode_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM Unicode characters passed")
 
     def test_ar_numbers_and_symbols(self):
@@ -593,9 +593,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "100% correct",
             "α β γ δ"
         ]
-        main_results = compute_with_main(number_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(number_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(number_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR numbers and symbols passed")
 
     def test_mlm_numbers_and_symbols(self):
@@ -607,9 +607,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "100% correct",
             "α β γ δ"
         ]
-        main_results = compute_with_main(number_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(number_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(number_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM numbers and symbols passed")
 
     def test_ar_repeated_tokens(self):
@@ -620,9 +620,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Hello Hello Hello",
             "!!! !!! !!!"
         ]
-        main_results = compute_with_main(repeated_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(repeated_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(repeated_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR repeated tokens passed")
 
     def test_mlm_repeated_tokens(self):
@@ -633,9 +633,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "Hello Hello Hello",
             "!!! !!! !!!"
         ]
-        main_results = compute_with_main(repeated_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(repeated_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(repeated_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM repeated tokens passed")
 
     def test_ar_mixed_case(self):
@@ -647,9 +647,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "lowercase text",
             "Title Case Text"
         ]
-        main_results = compute_with_main(mixed_case_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(mixed_case_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(mixed_case_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR mixed case passed")
 
     def test_mlm_mixed_case(self):
@@ -661,9 +661,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "lowercase text",
             "Title Case Text"
         ]
-        main_results = compute_with_main(mixed_case_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(mixed_case_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(mixed_case_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM mixed case passed")
 
     def test_ar_contractions(self):
@@ -675,9 +675,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "It's working.",
             "They've done it."
         ]
-        main_results = compute_with_main(contraction_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(contraction_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(contraction_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR contractions passed")
 
     def test_mlm_contractions(self):
@@ -689,9 +689,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "It's working.",
             "They've done it."
         ]
-        main_results = compute_with_main(contraction_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(contraction_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(contraction_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM contractions passed")
 
     def test_ar_urls_and_paths(self):
@@ -702,9 +702,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "File path: C:\\Users\\Documents\\file.txt",
             "Link: http://github.com/user/repo"
         ]
-        main_results = compute_with_main(url_texts, AR_MODEL, 'ar')
+        scorer_results = compute_with_scorer(url_texts, AR_MODEL, 'ar')
         minicons_results = compute_with_minicons(url_texts, AR_MODEL, 'ar')
-        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        self._compare_surprisals(scorer_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR URLs and paths passed")
 
     def test_mlm_urls_and_paths(self):
@@ -715,9 +715,9 @@ class TestMiniconsSurprisal(unittest.TestCase):
             "File path: C:\\Users\\Documents\\file.txt",
             "Link: http://github.com/user/repo"
         ]
-        main_results = compute_with_main(url_texts, MLM_MODEL, 'mlm')
+        scorer_results = compute_with_scorer(url_texts, MLM_MODEL, 'mlm')
         minicons_results = compute_with_minicons(url_texts, MLM_MODEL, 'mlm')
-        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        self._compare_surprisals(scorer_results, minicons_results, MLM_MODEL, 'mlm')
         print(f"✓ MLM URLs and paths passed")
         
 if __name__ == "__main__":

@@ -8,9 +8,8 @@ cd /d "%~dp0"
 if not exist "out" mkdir "out"
 
 echo ===== Run 1: AR without left context (beam)=====
-python -u "src\main.py" ^
+python -u "src\scorer.py" ^
   --input_file "in\demo_sentences.tsv" ^
-  --output_file "out\demo_sentences_nocontext.tsv" ^
   --lookahead_strategy "beam" ^
   --lookahead_n 3 ^
   --top_k 3 ^
@@ -25,9 +24,8 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo.
 echo ===== Run 2: AR with left context (beam) =====
-python -u "src\main.py" ^
+python -u "src\scorer.py" ^
   --input_file "in\demo_sentences.tsv" ^
-  --output_file "out\demo_sentences_withcontext.tsv" ^
   --left_context_file "in\demo_context.txt" ^
   --lookahead_strategy "beam" ^
   --lookahead_n 3 ^
@@ -38,9 +36,8 @@ python -u "src\main.py" ^
 
 echo.
 echo ===== Run 3: Masked token =====
-python -u "src\main.py" ^
+python -u "src\scorer.py" ^
   --input_file "in\demo_sentences.tsv" ^
-  --output_file "out\demo_sentences_mlm.tsv" ^
   --left_context_file "in\demo_context.txt" ^
   --top_k 3 ^
   --mode "mlm" ^

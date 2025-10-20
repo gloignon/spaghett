@@ -5,7 +5,7 @@ and exporting the top-k most probable next tokens for each scored token.
 
 CLI parameters:
     --input_file: Path to the input TSV file with documents or sentences.
-    --output_file: Path to the output TSV file (default: simple_output.tsv).
+    --output_file: Path to the output TSV file (default: will create one based on input file and timestamp). You can also provide a folder path for the output file, and it will create a timestamped file inside that folder. 
     --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
     --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
     --format: 'documents' or 'sentences' to specify input format.
@@ -83,12 +83,87 @@ Notes:
 import argparse
 import csv
 import math
+import os
 import re
+import sys
+from datetime import datetime
+from pathlib import Path
 from typing import List, Tuple
+from dataclasses import dataclass
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 from tqdm import tqdm
+
+@dataclass
+class ScoringConfig:
+    mode: str
+    model_name: str
+    pll_metric: str = 'original'
+    lookahead_strategy: str = 'greedy'
+    top_k: int = 3
+    lookahead_n: int = 3  # Default for AR, will be adjusted in __post_init__
+    beam_width: int = 3
+
+    _VALID_MODES = frozenset({'ar', 'mlm'})
+    _VALID_STRATEGIES = frozenset({'greedy', 'beam'})
+    _VALID_PLL = frozenset({'original', 'within_word_l2r'})
+
+    def __post_init__(self):
+        """Adjust defaults based on mode before validation."""
+        # Auto-adjust lookahead_n for MLM mode if user didn't explicitly set it
+        # We can't detect "user didn't set it" in __init__, but we can make it smart:
+        # If mode is MLM and lookahead_n > 0, set it to 0
+        if self.mode == 'mlm' and self.lookahead_n > 0:
+            object.__setattr__(self, 'lookahead_n', 0)
+        
+        # Similarly for lookahead_strategy
+        if self.mode == 'mlm' and self.lookahead_strategy != 'greedy':
+            object.__setattr__(self, 'lookahead_strategy', 'greedy')
+
+    def validate(self) -> None:
+        errors = []
+        
+        # Basic type/range validation
+        if self.mode not in self._VALID_MODES:
+            errors.append(f"mode must be one of {sorted(self._VALID_MODES)}, got '{self.mode}'")
+        if self.top_k < 0:  # Changed from < 1 to < 0
+            errors.append(f"top_k must be >= 0, got {self.top_k}")
+        if self.lookahead_n < 0:
+            errors.append(f"lookahead_n must be >= 0, got {self.lookahead_n}")
+        if self.lookahead_strategy not in self._VALID_STRATEGIES:
+            errors.append(f"lookahead_strategy must be one of {sorted(self._VALID_STRATEGIES)}, got '{self.lookahead_strategy}'")
+        if self.beam_width < 1:
+            errors.append(f"beam_width must be >= 1, got {self.beam_width}")
+        if self.pll_metric not in self._VALID_PLL:
+            errors.append(f"pll_metric must be one of {sorted(self._VALID_PLL)}, got '{self.pll_metric}'")
+        
+        # Mode-specific validation
+        if self.mode == 'ar':
+            # AR mode: pll_metric not applicable
+            if self.pll_metric != 'original':
+                errors.append(f"pll_metric is only applicable in MLM mode, got '{self.pll_metric}'")
+            # Beam search requires beam_width
+            if self.lookahead_strategy == 'beam' and self.beam_width < 1:
+                errors.append(f"beam_width must be >= 1 when using beam search, got {self.beam_width}")
+        else:  # MLM mode
+            # MLM mode: top_k must be >= 1
+            if self.top_k < 1:
+                errors.append(f"top_k must be >= 1 in MLM mode, got {self.top_k}")
+        
+        # Warnings (don't block execution, just inform)
+        if self.mode == 'ar' and self.lookahead_strategy == 'beam' and self.beam_width > self.top_k and self.top_k > 0:
+            print(f"Warning: beam_width ({self.beam_width}) > top_k ({self.top_k}) may generate many sequences", file=sys.stderr)
+        
+        if self.top_k > 50:
+            print(f"Warning: top_k ({self.top_k}) is quite large, this may slow down processing", file=sys.stderr)
+        
+        if self.lookahead_n > 20:
+            print(f"Warning: lookahead_n ({self.lookahead_n}) is quite large, this may slow down processing", file=sys.stderr)
+        
+        if errors:
+            bullet = "\n  • ".join(errors)
+            raise ValueError(f"Invalid scoring configuration:\n  • {bullet}")
 
 LN2 = math.log(2.0)
 
@@ -105,8 +180,36 @@ def simple_sentence_split(text: str) -> List[str]:
 
 def read_left_context(path: str) -> str:
     """Read left context from file, strip whitespace."""
-    with open(path, 'r', encoding='utf-8') as f:
-        return f.read().strip()
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Left context file not found: '{path}'\n"
+            f"Please check that the file path is correct and the file exists."
+        )
+    
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            
+        # Check if file is empty or contains only whitespace
+        if not content:
+            raise ValueError(
+                f"Left context file is empty: '{path}'\n"
+                f"The context file must contain text to use as left context.\n"
+            )
+            
+        return content
+        
+    except PermissionError:
+        raise PermissionError(
+            f"Permission denied when trying to read: '{path}'\n"
+            f"Please check file permissions."
+        )
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"Failed to decode file '{path}' as UTF-8.\n"
+            f"Please ensure the file is UTF-8 encoded.\n"
+            f"Error: {str(e)}"
+        )
 
 
 def combine_context_and_sentence(context: str, sentence: str) -> str:
@@ -533,30 +636,85 @@ def score_masked_lm_l2r(
 
 def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, str]]:
     """Load input TSV and return list of (doc_id, sentence_id, sentence)."""
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(
+            f"Input file not found: '{input_file}'\n"
+            f"Please check that the file path is correct and the file exists."
+        )
+    
+    # Define expected format once
+    required_cols = ['doc_id', 'text'] if format_type == 'documents' else ['doc_id', 'sentence_id', 'sentence']
+    min_cols = len(required_cols)
+    
     data = []
     
-    with open(input_file, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f, delimiter='\t')
-        next(reader)  # Skip header
-        
-        for row_num, row in enumerate(reader, start=2):
-            if not row or all(cell.strip() == '' for cell in row):
-                continue
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            
+            # Try to read header
+            try:
+                header = next(reader)
+            except StopIteration:
+                raise ValueError(
+                    f"Input file is empty: '{input_file}'\n"
+                    f"Expected format: {chr(9).join(required_cols)}"
+                )
+            
+            # Validate header
+            if len(header) < min_cols:
+                raise ValueError(
+                    f"Invalid header in '{input_file}'\n"
+                    f"Expected {min_cols} columns: {', '.join(required_cols)}\n"
+                    f"Got {len(header)}: {', '.join(header) if header else '(empty)'}"
+                )
+            
+            # Warn if names don't match
+            header_lower = [col.lower().strip() for col in header[:min_cols]]
+            if header_lower != required_cols:
+                print(f"Warning: Expected columns {required_cols}, got {header[:min_cols]}")
+            
+            # Read data rows
+            row_count = 0
+            for row_num, row in enumerate(reader, start=2):
+                # Skip completely empty rows
+                if not row or all(cell.strip() == '' for cell in row):
+                    continue
                 
-            if format_type == 'documents':
-                if len(row) < 2:
-                    print(f"Warning: Skipping malformed row {row_num}: expected 2 columns, got {len(row)}")
+                row_count += 1
+                  
+                if len(row) < min_cols:
+                    print(f"Warning: Skipping row {row_num}: expected {min_cols} columns, got {len(row)}")
                     continue
-                doc_id, text = row[0], row[1]
-                sentences = simple_sentence_split(text)
-                for sent_idx, sent in enumerate(sentences, 1):
-                    data.append((doc_id, str(sent_idx), sent))
-            else:  # sentences
-                if len(row) < 3:
-                    print(f"Warning: Skipping malformed row {row_num}: expected 3 columns, got {len(row)}")
-                    continue
-                doc_id, sent_id, sentence = row[0], row[1], row[2]
-                data.append((doc_id, sent_id, sentence))
+                
+                # Extract and validate
+                if format_type == 'documents':
+                    doc_id, text = row[0].strip(), row[1].strip()
+                    if not doc_id or not text:
+                        print(f"Warning: Skipping row {row_num}: empty field(s)")
+                        continue
+                    sentences = simple_sentence_split(text)
+                    data.extend((doc_id, str(i), s) for i, s in enumerate(sentences, 1))
+                else:
+                    doc_id, sent_id, sentence = row[0].strip(), row[1].strip(), row[2].strip()
+                    if not (doc_id and sent_id and sentence):
+                        print(f"Warning: Skipping row {row_num}: empty field(s)")
+                        continue
+                    data.append((doc_id, sent_id, sentence))
+            
+            # Check results
+            if row_count == 0:
+                raise ValueError(f"No data rows in '{input_file}'")
+            if not data:
+                raise ValueError(
+                    f"No valid data in '{input_file}' ({row_count} rows were malformed)\n"
+                    f"Expected format: {chr(9).join(required_cols)}"
+                )
+                
+    except PermissionError:
+        raise PermissionError(f"Permission denied: '{input_file}'")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"File '{input_file}' is not UTF-8 encoded: {e}")
     
     return data
 
@@ -597,30 +755,18 @@ def process_sentences(
     doc_ids: List[str] = None,
     sentence_ids: List[str] = None,
     progress: bool = True,
-    pll_metric: str = 'original'  # <- added
+    pll_metric: str = 'original'
 ) -> List[dict]:
-    """
-    Process sentences and return results as list of dicts.
-    
-    This is the core function - independent of input/output format.
-    Can be called from CLI, R, or other Python scripts.
-    
-    Args:
-        sentences: List of sentence strings to score
-        mode: 'ar' or 'mlm'
-        model_name: HuggingFace model identifier
-        left_context: Context string prepended to each sentence (default: '')
-        top_k: Number of top predictions to return
-        lookahead_n: (AR only) Number of lookahead tokens
-        lookahead_strategy: (AR only) 'greedy' or 'beam'
-        beam_width: (AR only) Beam width for beam search
-        doc_ids: Optional document IDs (default: auto-generated)
-        sentence_ids: Optional sentence IDs (default: auto-generated)
-        progress: Show progress bar (default: True)
-    
-    Returns:
-        List of dicts with columns matching output TSV format
-    """
+    config = ScoringConfig(
+        mode=mode,
+        model_name=model_name,
+        top_k=top_k,
+        lookahead_n=lookahead_n,
+        lookahead_strategy=lookahead_strategy,
+        beam_width=beam_width,
+        pll_metric=pll_metric
+    )
+    config.validate()
     # Auto-generate IDs if not provided
     if doc_ids is None:
         doc_ids = ['doc1'] * len(sentences)
@@ -630,27 +776,45 @@ def process_sentences(
     if len(doc_ids) != len(sentences) or len(sentence_ids) != len(sentences):
         raise ValueError("doc_ids and sentence_ids must match length of sentences")
     
-    # Load model
-    print(f"Loading {mode.upper()} model: {model_name}")  # keep previous behavior if present
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Load model with error handling
+    print(f"Loading {mode.upper()} model: {model_name}")
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        raise ValueError(
+            f"Failed to load tokenizer for model '{model_name}'. "
+            f"Please check that the model exists on HuggingFace Hub or provide a valid local path. "
+            f"Error: {type(e).__name__}: {str(e)}"
+        )
     
     # Pre-tokenize context once
     context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     
-    if mode == 'ar':
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-        score_fn = lambda s: score_autoregressive(
-            s, left_context, tokenizer, model, top_k, lookahead_n,
-            lookahead_strategy, beam_width, context_ids
-        )
-    elif mode == 'mlm':
-        model = AutoModelForMaskedLM.from_pretrained(model_name)
-        if pll_metric == 'within_word_l2r':
-            score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids)
+    try:
+        if mode == 'ar':
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+            score_fn = lambda s: score_autoregressive(
+                s, left_context, tokenizer, model, top_k, lookahead_n,
+                lookahead_strategy, beam_width, context_ids
+            )
+        elif mode == 'mlm':
+            model = AutoModelForMaskedLM.from_pretrained(model_name)
+            if pll_metric == 'within_word_l2r':
+                score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids)
+            else:
+                score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
         else:
-            score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
-    else:
-        raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
+            raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
+    except Exception as e:
+        if "Invalid mode" in str(e):
+            raise  # Re-raise our own validation error
+        raise ValueError(
+            f"Failed to load model '{model_name}' for mode '{mode}'. "
+            f"Please verify: (1) model exists, (2) model is compatible with {mode.upper()} mode "
+            f"(AR models like GPT for 'ar', MLM models like BERT for 'mlm'). "
+            f"Error: {type(e).__name__}: {str(e)}"
+        )
     
     model.eval()
     
@@ -707,66 +871,179 @@ def process_from_file(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    pll_metric: str = 'original'  # <- added
+    pll_metric: str = 'original'
 ):
     """
     Process input TSV file and write output TSV file.
     
     This function handles I/O for CLI usage.
     """
-    # Load context
-    left_context = read_left_context(left_context_file) if left_context_file else ''
-    
-    # Load data
-    print(f"Loading input from: {input_file}")
-    data = load_input_data(input_file, format_type)
-    
-    # Extract components
-    doc_ids = [item[0] for item in data]
-    sentence_ids = [item[1] for item in data]
-    sentences = [item[2] for item in data]
-    
-    # Process using core function
-    results = process_sentences(
-        sentences=sentences,
-        mode=mode,
-        model_name=model_name,
-        left_context=left_context,
-        top_k=top_k,
-        lookahead_n=lookahead_n,
-        lookahead_strategy=lookahead_strategy,
-        beam_width=beam_width,
-        doc_ids=doc_ids,
-        sentence_ids=sentence_ids,
-        progress=True,
-        pll_metric=pll_metric  # <- added
-    )
-    
-    # Write output
-    write_output(output_file, results, top_k, lookahead_n, mode)
-    print(f"Results written to: {output_file}")
+    try:
+        # Load context
+        left_context = ''
+        if left_context_file:
+            print(f"Loading left context from: {left_context_file}")
+            left_context = read_left_context(left_context_file)
+        
+        # Load data
+        print(f"Loading input from: {input_file}")
+        data = load_input_data(input_file, format_type)
+        
+        if not data:
+            print(f"Warning: No valid data found in {input_file}")
+            print("Please check that:")
+            print("  1. File has correct format (TSV with header)")
+            print("  2. File contains data rows (not just header)")
+            print("  3. Rows have correct number of columns")
+            return
+        
+        # Extract components
+        doc_ids = [item[0] for item in data]
+        sentence_ids = [item[1] for item in data]
+        sentences = [item[2] for item in data]
+        
+        # Process using core function
+        results = process_sentences(
+            sentences=sentences,
+            mode=mode,
+            model_name=model_name,
+            left_context=left_context,
+            top_k=top_k,
+            lookahead_n=lookahead_n,
+            lookahead_strategy=lookahead_strategy,
+            beam_width=beam_width,
+            doc_ids=doc_ids,
+            sentence_ids=sentence_ids,
+            progress=True,
+            pll_metric=pll_metric
+        )
+        
+        # Write output
+        write_output(output_file, results, top_k, lookahead_n, mode)
+        print(f"Results written to: {output_file}")
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except PermissionError as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Compute per-token surprisal and entropy.")
+    parser = argparse.ArgumentParser(
+        description="Compute per-token surprisal and entropy.",
+        epilog="""
+Examples:
+  # Score sentences with GPT-2 (autoregressive)
+  python scorer.py --input_file data.tsv --mode ar --model gpt2
+  
+  # Score documents with BERT (masked LM)
+  python scorer.py --input_file docs.tsv --mode mlm --model bert-base-uncased --format documents
+  
+  # Output to folder (auto-generates filename)
+  python scorer.py --input_file data.tsv --mode ar --model gpt2 --output_file ./results/
+  
+  # With custom output and context
+  python scorer.py --input_file data.tsv --output_file results.tsv --mode ar --model gpt2 \\
+                   --left_context_file context.txt --top_k 10
+  
+  # With within-word L2R scoring (MLM only)
+  python scorer.py --input_file data.tsv --mode mlm --model bert-base-uncased \\
+                   --pll_metric within_word_l2r
+
+For more information, see the documentation at the top of this file.
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument('--input_file', required=True, help='Input TSV file')
-    parser.add_argument('--output_file', default='simple_output.tsv', help='Output TSV file')
-    parser.add_argument('--mode', choices=['ar', 'mlm'], required=True, help='Model mode')
-    parser.add_argument('--model', required=True, help='Model name from HuggingFace')
-    parser.add_argument('--format', choices=['documents', 'sentences'], required=True, help='Input format')
-    parser.add_argument('--left_context_file', default='', help='File with left context')
-    parser.add_argument('--top_k', type=int, default=5, help='Number of top-k predictions')
-    parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens')
+    parser.add_argument('--output_file', default='simple_output.tsv', help='Output TSV file or folder (default: auto-generated filename in current directory)')
+    parser.add_argument('--mode', choices=['ar', 'mlm'], required=True, 
+                       help='Model mode: "ar" for autoregressive (GPT), "mlm" for masked LM (BERT)')
+    parser.add_argument('--model', required=True, 
+                       help='HuggingFace model name (e.g., "gpt2", "bert-base-uncased")')
+    parser.add_argument('--format', choices=['documents', 'sentences'], default="sentences", 
+                       help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
+    parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
+    parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
+    parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens (default: 3)')
     parser.add_argument('--lookahead_strategy', choices=['greedy', 'beam'], default='greedy', 
-                       help='AR: lookahead strategy (greedy or beam search)')
-    parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search')
+                       help='AR: lookahead strategy - greedy or beam search (default: greedy)')
+    parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
-                        default='original', help='MLM PLL variant (default: original)')
+                        default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    
+    # Check if no arguments provided
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        print("\n❌ Error: No arguments provided. At minimum, you need:", file=sys.stderr)
+        print("  --input_file <file> --mode <ar|mlm> --model <name>\n", file=sys.stderr)
+        sys.exit(1)
+    
     args = parser.parse_args()
+
+    # Validate parameters using ScoringConfig
+    try:
+        ScoringConfig(
+            mode=args.mode,
+            model_name=args.model,
+            top_k=args.top_k,
+            lookahead_n=args.lookahead_n,
+            lookahead_strategy=args.lookahead_strategy,
+            beam_width=args.beam_width,
+            pll_metric=args.pll_metric
+        ).validate()
+    except ValueError as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build filename parts
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_short = args.model.replace('/', '_').split('-')[0]
+    parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
+    
+    if args.left_context_file:
+        parts.append('extra')
+    if args.mode == 'ar' and args.lookahead_n > 0:
+        parts.append(f'look{args.lookahead_n}')
+        if args.lookahead_strategy == 'beam':
+            parts.append(f'beam{args.beam_width}')
+    if args.pll_metric == 'within_word_l2r':
+        parts.append('L2R')
+    
+    parts.append(timestamp)
+    generated_filename = '_'.join(parts) + '.tsv'
+    
+    # Determine output path
+    output_path = Path(args.output_file)
+    
+    if output_path.is_dir() or (not output_path.exists() and output_path.suffix == ''):
+        # Directory path (existing or to-be-created)
+        output_path.mkdir(parents=True, exist_ok=True)
+        final_output = output_path / generated_filename
+        print(f"→ Output: {final_output}")
+    elif args.output_file == 'simple_output.tsv':
+        # Default
+        final_output = Path(generated_filename)
+        print(f"→ Output: {final_output}")
+    else:
+        # Specific filename
+        final_output = output_path
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        print(f"→ Output: {final_output}")
+    
     process_from_file(
         input_file=args.input_file,
-        output_file=args.output_file,
+        output_file=str(final_output),
         mode=args.mode,
         model_name=args.model,
         format_type=args.format,
@@ -775,8 +1052,9 @@ def main():
         lookahead_n=args.lookahead_n,
         lookahead_strategy=args.lookahead_strategy,
         beam_width=args.beam_width,
-        pll_metric=args.pll_metric  # <- added
+        pll_metric=args.pll_metric
     )
 
 if __name__ == "__main__":
-    main()  
+    main()
+
