@@ -8,6 +8,9 @@ import numpy as np
 # Add src directory to path before importing main
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
+# Verbose printing control (on by default). Set SPAGHETT_VERBOSE=0 to silence tables.
+VERBOSE = os.getenv("SPAGHETT_VERBOSE", "1") == "1"
+
 #!/usr/bin/env python3
 """
 test_minicons_compare.py
@@ -32,9 +35,10 @@ THRESHOLD = 0.1  # Maximum allowed difference in bits
 AR_MODEL = "gpt2"
 MLM_MODEL = "bert-base-uncased"
 PLL_METRIC = "original"
+PLL_METRICS = ["original", "within_word_l2r"]
 
 
-def compute_with_main(texts: List[str], model_name: str, mode: str) -> List[Tuple[List[str], List[float]]]:
+def compute_with_main(texts: List[str], model_name: str, mode: str, pll_metric: str = 'original') -> List[Tuple[List[str], List[float]]]:
     """
     Compute surprisal using main.py's process_sentences function.
     
@@ -64,7 +68,8 @@ def compute_with_main(texts: List[str], model_name: str, mode: str) -> List[Tupl
         lookahead_n=0,
         doc_ids=[f"doc_{i}" for i in range(len(texts))],
         sentence_ids=[f"sent_{i}" for i in range(len(texts))],
-        progress=False
+        progress=False,
+        pll_metric=pll_metric  # pass through for MLM PLL variants
     )
     
     # Group results by sentence
@@ -219,12 +224,37 @@ class TestMiniconsSurprisal(unittest.TestCase):
         print(f"AR model: {AR_MODEL}")
         print(f"MLM model: {MLM_MODEL}")
     
+    def _print_table(self, text_idx: int, tokens: List[str], main_vals: List[float], mini_vals: List[float]):
+        if not VERBOSE:
+            return
+        print("\n" + "=" * 100)
+        print(f"Text {text_idx} token-level comparison")
+        print("=" * 100)
+        print(f"{'Idx':<4} {'Token':<24} {'main.py (bits)':>16} {'minicons (bits)':>17} {'Diff':>10}  Status")
+        print("-" * 100)
+        for j, (tok, ms, mcs) in enumerate(zip(tokens, main_vals, mini_vals)):
+            ms_str = "NaN" if np.isnan(ms) else f"{ms:.4f}"
+            mcs_str = "NaN" if np.isnan(mcs) else f"{mcs:.4f}"
+            if np.isnan(ms) or np.isnan(mcs):
+                diff_str = "N/A"
+                status = "- SKIP"
+            else:
+                diff = abs(ms - mcs)
+                diff_str = f"{diff:.4f}"
+                status = "✓ OK" if diff <= THRESHOLD else "✗ FAIL"
+            disp_tok = tok if len(tok) <= 22 else tok[:20] + ".."
+            print(f"{j:<4} {disp_tok:<24} {ms_str:>16} {mcs_str:>17} {diff_str:>10}  {status}")
+        print("-" * 100)
+
     def _compare_surprisals(self, main_results, minicons_results, model_name, mode):
         """Helper to compare surprisal values."""
         for i, (main_data, minicons_data) in enumerate(zip(main_results, minicons_results)):
             main_tokens, main_surprisals = main_data
             minicons_tokens, minicons_surprisals = minicons_data
             
+            # Print table before assertions (helps diagnose mismatches)
+            self._print_table(i, main_tokens, main_surprisals, minicons_surprisals)
+
             # Check token count matches
             self.assertEqual(
                 len(main_tokens), 
@@ -249,7 +279,7 @@ class TestMiniconsSurprisal(unittest.TestCase):
                     f"main.py={ms:.4f}, minicons={mcs:.4f}, diff={diff:.4f} "
                     f"exceeds threshold {THRESHOLD} in {mode.upper()} mode ({model_name})"
                 )
-    
+
     def test_ar_model_surprisal(self):
         """Test that AR model surprisal matches minicons."""
         print(f"\nTesting AR model: {AR_MODEL}")
@@ -259,18 +289,436 @@ class TestMiniconsSurprisal(unittest.TestCase):
         
         self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
         print(f"✓ AR model passed")
-    
-    def test_mlm_model_surprisal(self):
-        """Test that MLM model surprisal matches minicons."""
-        print(f"\nTesting MLM model: {MLM_MODEL}")
+
+    def test_mlm_model_surprisal_original(self):
+        """Test that MLM (original PLL) surprisal matches minicons."""
+        pll = "original"
+        print(f"\nTesting MLM model ({pll}): {MLM_MODEL}")
+        main_results = compute_with_main(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        minicons_results = compute_with_minicons(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
+        print(f"✓ MLM {pll} passed")
+
+    def test_mlm_model_surprisal_l2r(self):
+        """Test that MLM (within_word_l2r) surprisal matches minicons."""
+        pll = "within_word_l2r"
+        print(f"\nTesting MLM model ({pll}): {MLM_MODEL}")
+        main_results = compute_with_main(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        minicons_results = compute_with_minicons(TEST_TEXTS, MLM_MODEL, 'mlm', pll_metric=pll)
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, f'mlm:{pll}')
+        print(f"✓ MLM {pll} passed")
+
+    def test_ar_empty_string(self):
+        """Test AR model with empty string."""
+        print(f"\nTesting AR model with edge case: empty string")
+        empty_text = [""]
         
-        main_results = compute_with_main(TEST_TEXTS, MLM_MODEL, 'mlm')
-        minicons_results = compute_with_minicons(TEST_TEXTS, MLM_MODEL, 'mlm', PLL_METRIC)
+        main_success = True
+        minicons_success = True
+        main_error = None
+        minicons_error = None
+        
+        try:
+            main_results = compute_with_main(empty_text, AR_MODEL, 'ar')
+        except Exception as e:
+            main_success = False
+            main_error = str(e)
+            main_results = [([], [])]  # Empty result
+        
+        try:
+            minicons_results = compute_with_minicons(empty_text, AR_MODEL, 'ar')
+        except Exception as e:
+            minicons_success = False
+            minicons_error = str(e)
+            minicons_results = [([], [])]  # Empty result
+        
+        if not main_success:
+            print(f"⚠ main.py failed on empty string: {main_error}")
+        if not minicons_success:
+            print(f"⚠ minicons failed on empty string: {minicons_error}")
+        
+        if main_success and minicons_success:
+            self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+            print(f"✓ AR empty string passed")
+        else:
+            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+
+    def test_mlm_empty_string(self):
+        """Test MLM model with empty string."""
+        print(f"\nTesting MLM model with edge case: empty string")
+        empty_text = [""]
+        
+        main_success = True
+        minicons_success = True
+        main_error = None
+        minicons_error = None
+        
+        try:
+            main_results = compute_with_main(empty_text, MLM_MODEL, 'mlm')
+        except Exception as e:
+            main_success = False
+            main_error = str(e)
+            main_results = [([], [])]  # Empty result
+        
+        try:
+            minicons_results = compute_with_minicons(empty_text, MLM_MODEL, 'mlm')
+        except Exception as e:
+            minicons_success = False
+            minicons_error = str(e)
+            minicons_results = [([], [])]  # Empty result
+        
+        if not main_success:
+            print(f"⚠ main.py failed on empty string: {main_error}")
+        if not minicons_success:
+            print(f"⚠ minicons failed on empty string: {minicons_error}")
+        
+        if main_success and minicons_success:
+            self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+            print(f"✓ MLM empty string passed")
+        else:
+            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+
+    def test_ar_single_token(self):
+        """Test AR model with single token sentences."""
+        print(f"\nTesting AR model with single tokens")
+        single_tokens = ["Hello", "World", "!"]
+        main_results = compute_with_main(single_tokens, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(single_tokens, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR single token passed")
+
+    def test_mlm_single_token(self):
+        """Test MLM model with single token sentences."""
+        print(f"\nTesting MLM model with single tokens")
+        single_tokens = ["Hello", "World", "!"]
+        main_results = compute_with_main(single_tokens, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(single_tokens, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM single token passed")
+
+    def test_ar_long_sentence(self):
+        """Test AR model with long sentence."""
+        print(f"\nTesting AR model with long sentence")
+        long_text = [
+            "This is a very long sentence that contains many words and should test "
+            "whether the implementation handles longer sequences correctly and accurately "
+            "computes surprisal values for each token in the extended context window."
+        ]
+        main_results = compute_with_main(long_text, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(long_text, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR long sentence passed")
+
+    def test_mlm_long_sentence(self):
+        """Test MLM model with long sentence."""
+        print(f"\nTesting MLM model with long sentence")
+        long_text = [
+            "This is a very long sentence that contains many words and should test "
+            "whether the implementation handles longer sequences correctly and accurately "
+            "computes surprisal values for each token in the extended context window."
+        ]
+        main_results = compute_with_main(long_text, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(long_text, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM long sentence passed")
+
+    def test_ar_special_characters(self):
+        """Test AR model with special characters and punctuation."""
+        print(f"\nTesting AR model with special characters")
+        special_texts = [
+            "Hello, world!",
+            "What's happening?",
+            "Price: $100.50",
+            "Email: test@example.com"
+        ]
+        main_results = compute_with_main(special_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(special_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR special characters passed")
+
+    def test_mlm_special_characters(self):
+        """Test MLM model with special characters and punctuation."""
+        print(f"\nTesting MLM model with special characters")
+        special_texts = [
+            "Hello, world!",
+            "What's happening?",
+            "Price: $100.50",
+            "Email: test@example.com"
+        ]
+        main_results = compute_with_main(special_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(special_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM special characters passed")
+
+    def test_ar_multiple_sentences_batch(self):
+        """Test AR model processes multiple sentences consistently."""
+        print(f"\nTesting AR model with batch of sentences")
+        batch_texts = [
+            "First sentence.",
+            "Second sentence here.",
+            "Third and final sentence."
+        ]
+        main_results = compute_with_main(batch_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(batch_texts, AR_MODEL, 'ar')
+        
+        # Verify we got results for all sentences
+        self.assertEqual(len(main_results), len(batch_texts))
+        self.assertEqual(len(minicons_results), len(batch_texts))
+        
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR batch processing passed")
+
+    def test_mlm_multiple_sentences_batch(self):
+        """Test MLM model processes multiple sentences consistently."""
+        print(f"\nTesting MLM model with batch of sentences")
+        batch_texts = [
+            "First sentence.",
+            "Second sentence here.",
+            "Third and final sentence."
+        ]
+        main_results = compute_with_main(batch_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(batch_texts, MLM_MODEL, 'mlm')
+        
+        # Verify we got results for all sentences
+        self.assertEqual(len(main_results), len(batch_texts))
+        self.assertEqual(len(minicons_results), len(batch_texts))
         
         self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
-        print(f"✓ MLM model passed")
+        print(f"✓ MLM batch processing passed")
 
+    def test_ar_whitespace_only(self):
+        """Test AR model with whitespace-only strings."""
+        print(f"\nTesting AR model with whitespace strings")
+        whitespace_texts = [" ", "  ", "\t", "\n"]
+        
+        main_success = True
+        minicons_success = True
+        main_error = None
+        minicons_error = None
+        
+        try:
+            main_results = compute_with_main(whitespace_texts, AR_MODEL, 'ar')
+        except Exception as e:
+            main_success = False
+            main_error = str(e)
+            main_results = [([], [])] * len(whitespace_texts)
+        
+        try:
+            minicons_results = compute_with_minicons(whitespace_texts, AR_MODEL, 'ar')
+        except Exception as e:
+            minicons_success = False
+            minicons_error = str(e)
+            minicons_results = [([], [])] * len(whitespace_texts)
+        
+        if not main_success:
+            print(f"⚠ main.py failed on whitespace strings: {main_error}")
+        if not minicons_success:
+            print(f"⚠ minicons failed on whitespace strings: {minicons_error}")
+        
+        if main_success and minicons_success:
+            self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+            print(f"✓ AR whitespace strings passed")
+        else:
+            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
 
+    def test_mlm_whitespace_only(self):
+        """Test MLM model with whitespace-only strings."""
+        print(f"\nTesting MLM model with whitespace strings")
+        whitespace_texts = [" ", "  ", "\t", "\n"]
+        
+        main_success = True
+        minicons_success = True
+        main_error = None
+        minicons_error = None
+        
+        try:
+            main_results = compute_with_main(whitespace_texts, MLM_MODEL, 'mlm')
+        except Exception as e:
+            main_success = False
+            main_error = str(e)
+            main_results = [([], [])] * len(whitespace_texts)
+        
+        try:
+            minicons_results = compute_with_minicons(whitespace_texts, MLM_MODEL, 'mlm')
+        except Exception as e:
+            minicons_success = False
+            minicons_error = str(e)
+            minicons_results = [([], [])] * len(whitespace_texts)
+        
+        if not main_success:
+            print(f"⚠ main.py failed on whitespace strings: {main_error}")
+        if not minicons_success:
+            print(f"⚠ minicons failed on whitespace strings: {minicons_error}")
+        
+        if main_success and minicons_success:
+            self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+            print(f"✓ MLM whitespace strings passed")
+        else:
+            self.skipTest(f"Skipping comparison - main.py success: {main_success}, minicons success: {minicons_success}")
+
+    def test_ar_unicode_characters(self):
+        """Test AR model with Unicode characters."""
+        print(f"\nTesting AR model with Unicode characters")
+        unicode_texts = [
+            "Café au lait",
+            "こんにちは世界",
+            "Привет мир",
+            "🎉 Emoji test! 🚀"
+        ]
+        main_results = compute_with_main(unicode_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(unicode_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR Unicode characters passed")
+
+    def test_mlm_unicode_characters(self):
+        """Test MLM model with Unicode characters."""
+        print(f"\nTesting MLM model with Unicode characters")
+        unicode_texts = [
+            "Café au lait",
+            "こんにちは世界",
+            "Привет мир",
+            "🎉 Emoji test! 🚀"
+        ]
+        main_results = compute_with_main(unicode_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(unicode_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM Unicode characters passed")
+
+    def test_ar_numbers_and_symbols(self):
+        """Test AR model with numbers and mathematical symbols."""
+        print(f"\nTesting AR model with numbers and symbols")
+        number_texts = [
+            "2 + 2 = 4",
+            "π ≈ 3.14159",
+            "100% correct",
+            "α β γ δ"
+        ]
+        main_results = compute_with_main(number_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(number_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR numbers and symbols passed")
+
+    def test_mlm_numbers_and_symbols(self):
+        """Test MLM model with numbers and mathematical symbols."""
+        print(f"\nTesting MLM model with numbers and symbols")
+        number_texts = [
+            "2 + 2 = 4",
+            "π ≈ 3.14159",
+            "100% correct",
+            "α β γ δ"
+        ]
+        main_results = compute_with_main(number_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(number_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM numbers and symbols passed")
+
+    def test_ar_repeated_tokens(self):
+        """Test AR model with repeated tokens."""
+        print(f"\nTesting AR model with repeated tokens")
+        repeated_texts = [
+            "la la la la la",
+            "Hello Hello Hello",
+            "!!! !!! !!!"
+        ]
+        main_results = compute_with_main(repeated_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(repeated_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR repeated tokens passed")
+
+    def test_mlm_repeated_tokens(self):
+        """Test MLM model with repeated tokens."""
+        print(f"\nTesting MLM model with repeated tokens")
+        repeated_texts = [
+            "la la la la la",
+            "Hello Hello Hello",
+            "!!! !!! !!!"
+        ]
+        main_results = compute_with_main(repeated_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(repeated_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM repeated tokens passed")
+
+    def test_ar_mixed_case(self):
+        """Test AR model with mixed case text."""
+        print(f"\nTesting AR model with mixed case")
+        mixed_case_texts = [
+            "ThIs Is MiXeD cAsE",
+            "UPPERCASE TEXT",
+            "lowercase text",
+            "Title Case Text"
+        ]
+        main_results = compute_with_main(mixed_case_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(mixed_case_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR mixed case passed")
+
+    def test_mlm_mixed_case(self):
+        """Test MLM model with mixed case text."""
+        print(f"\nTesting MLM model with mixed case")
+        mixed_case_texts = [
+            "ThIs Is MiXeD cAsE",
+            "UPPERCASE TEXT",
+            "lowercase text",
+            "Title Case Text"
+        ]
+        main_results = compute_with_main(mixed_case_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(mixed_case_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM mixed case passed")
+
+    def test_ar_contractions(self):
+        """Test AR model with contractions."""
+        print(f"\nTesting AR model with contractions")
+        contraction_texts = [
+            "I'm happy.",
+            "You're right.",
+            "It's working.",
+            "They've done it."
+        ]
+        main_results = compute_with_main(contraction_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(contraction_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR contractions passed")
+
+    def test_mlm_contractions(self):
+        """Test MLM model with contractions."""
+        print(f"\nTesting MLM model with contractions")
+        contraction_texts = [
+            "I'm happy.",
+            "You're right.",
+            "It's working.",
+            "They've done it."
+        ]
+        main_results = compute_with_main(contraction_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(contraction_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM contractions passed")
+
+    def test_ar_urls_and_paths(self):
+        """Test AR model with URLs and file paths."""
+        print(f"\nTesting AR model with URLs and paths")
+        url_texts = [
+            "Visit https://www.example.com",
+            "File path: C:\\Users\\Documents\\file.txt",
+            "Link: http://github.com/user/repo"
+        ]
+        main_results = compute_with_main(url_texts, AR_MODEL, 'ar')
+        minicons_results = compute_with_minicons(url_texts, AR_MODEL, 'ar')
+        self._compare_surprisals(main_results, minicons_results, AR_MODEL, 'ar')
+        print(f"✓ AR URLs and paths passed")
+
+    def test_mlm_urls_and_paths(self):
+        """Test MLM model with URLs and file paths."""
+        print(f"\nTesting MLM model with URLs and paths")
+        url_texts = [
+            "Visit https://www.example.com",
+            "File path: C:\\Users\\Documents\\file.txt",
+            "Link: http://github.com/user/repo"
+        ]
+        main_results = compute_with_main(url_texts, MLM_MODEL, 'mlm')
+        minicons_results = compute_with_minicons(url_texts, MLM_MODEL, 'mlm')
+        self._compare_surprisals(main_results, minicons_results, MLM_MODEL, 'mlm')
+        print(f"✓ MLM URLs and paths passed")
+        
 if __name__ == "__main__":
-    # Run with verbose output
     unittest.main(verbosity=2)

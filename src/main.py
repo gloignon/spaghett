@@ -260,6 +260,10 @@ def score_autoregressive(
             - List[float]: Entropy values (in bits) for each token.
             - List[List[str]]: For each token, a list containing the most probable token, top-k predictions, and lookahead tokens.
     """
+    # Handle empty or whitespace-only sentences
+    if not sentence or not sentence.strip():
+        return [], [], [], [], [], []
+    
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
@@ -352,15 +356,14 @@ def score_masked_lm(
     context_ids: List[int] = None
 ) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
     """
-    Score sentence with MLM using parallel masking.
-    
-    Instead of N forward passes (one per token), we do ONE forward pass
-    with all masked positions batched together. This should be faster.
-    
-    Left context is used for conditioning but NOT included in output.
+    Score sentence with MLM using parallel masking (original PLL).
     """
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
+    
+    # Handle empty or whitespace-only sentences
+    if not sentence or not sentence.strip():
+        return [], [], [], [], [], []
     
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
@@ -375,7 +378,7 @@ def score_masked_lm(
     
     num_tokens = len(sentence_ids)
     
-    # Create ALL masked versions at once
+    # Create ALL masked versions at once (mask current token only)
     masked_batch = []
     for sent_pos in range(num_tokens):
         combined_pos = sentence_start + sent_pos
@@ -383,38 +386,25 @@ def score_masked_lm(
         masked_ids[combined_pos] = tokenizer.mask_token_id
         masked_batch.append(masked_ids)
     
-    # Stack into batch: (num_tokens, seq_len)
     masked_batch = torch.stack(masked_batch)
     
-    # ONE forward pass for all masked positions!
     with torch.no_grad():
         outputs = model(masked_batch)
         all_logits = outputs.logits  # (num_tokens, seq_len, vocab_size)
     
-    # Extract logits for each masked position and score
-    raw_tokens = []
-    scored_tokens = []
-    is_special_flags = []
-    surprisals = []
-    entropies = []
-    pred_columns = []
+    raw_tokens, scored_tokens, is_special_flags = [], [], []
+    surprisals, entropies, pred_columns = [], [], []
     
     for sent_pos in range(num_tokens):
         combined_pos = sentence_start + sent_pos
         target_id = sentence_ids[sent_pos].item()
         is_special = 1 if special_mask[sent_pos] else 0
         
-        # Get logits for this token's masked position
         logits = all_logits[sent_pos, combined_pos]
         
-        # Calculate surprisal and entropy
         surprisal, entropy = compute_surprisal_entropy(logits, target_id)
-        
-        # Get top-k predictions
         top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
-        pred_col = top_k_tokens
         
-        # Decode token (both raw and readable)
         raw_token, token_str = decode_token(tokenizer, target_id, is_special)
         
         raw_tokens.append(raw_token)
@@ -422,7 +412,117 @@ def score_masked_lm(
         is_special_flags.append(is_special)
         surprisals.append(surprisal)
         entropies.append(entropy)
-        pred_columns.append(pred_col)
+        pred_columns.append(top_k_tokens)
+    
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+
+
+def score_masked_lm_l2r(
+    sentence: str,
+    tokenizer,
+    model,
+    top_k: int = 5,
+    context_ids: List[int] = None
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
+    """
+    Score sentence with MLM using within_word_l2r (minicons-compatible):
+    - For each word (group of subtokens), predict subtokens left-to-right.
+    - For subtoken k in a word, mask the current subtoken and all future subtokens
+      in that word; keep previous subtokens and all other tokens visible.
+    - Special tokens are scored by masking only themselves.
+    """
+    if tokenizer.mask_token_id is None:
+        raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
+    
+    # Handle empty or whitespace-only sentences
+    if not sentence or not sentence.strip():
+        return [], [], [], [], [], []
+    
+    # Tokenize sentence
+    encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
+    sentence_ids = encoding["input_ids"][0]  # (seq_len,)
+    if not sentence_ids.numel():
+        return [], [], [], [], [], []
+    
+    # Base + left context
+    base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
+    seq_len = len(sentence_ids)
+    special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
+    
+    # Word alignment (requires fast tokenizer)
+    if getattr(tokenizer, "is_fast", False) and hasattr(encoding, "word_ids"):
+        word_ids = encoding.word_ids(0)  # list length == seq_len, None for specials
+    else:
+        # Fallback: treat each token as its own word
+        word_ids = list(range(seq_len))
+    
+    # Build mapping word_id -> list of sentence positions (subtoken indices)
+    word_to_positions = {}
+    for pos, wid in enumerate(word_ids):
+        if wid is None:
+            continue
+        word_to_positions.setdefault(wid, []).append(pos)
+    
+    # Prepare one masked variant per sentence position (same batch size as seq_len)
+    masked_variants = []
+    variant_targets = []  # (sent_pos, combined_pos)
+    
+    mask_id = tokenizer.mask_token_id
+    
+    # For normal words: L2R within-word masking
+    for _, positions in word_to_positions.items():
+        for k, sent_pos in enumerate(positions):
+            combined_pos = sentence_start + sent_pos
+            ids = base_ids.clone()
+            # Mask current subtoken
+            ids[combined_pos] = mask_id
+            # Mask future subtokens within the same word
+            for future_pos in positions[k+1:]:
+                ids[sentence_start + future_pos] = mask_id
+            masked_variants.append(ids)
+            variant_targets.append((sent_pos, combined_pos))
+    
+    # For special tokens (word_id is None): mask only themselves
+    for sent_pos, wid in enumerate(word_ids):
+        if wid is None:
+            combined_pos = sentence_start + sent_pos
+            ids = base_ids.clone()
+            ids[combined_pos] = mask_id
+            masked_variants.append(ids)
+            variant_targets.append((sent_pos, combined_pos))
+    
+    if not masked_variants:
+        return [], [], [], [], [], []
+    
+    batch = torch.stack(masked_variants)  # (num_variants == seq_len, seq_total_len)
+    with torch.no_grad():
+        outputs = model(batch)
+        logits_batch = outputs.logits  # (num_variants, seq_total_len, vocab)
+    
+    # Prepare outputs aligned to sentence tokens (include specials)
+    raw_tokens, scored_tokens, is_special_flags = [], [], []
+    for sent_pos in range(seq_len):
+        tid = int(sentence_ids[sent_pos].item())
+        is_special = 1 if special_mask[sent_pos] else 0
+        raw_token, token_str = decode_token(tokenizer, tid, is_special)
+        raw_tokens.append(raw_token)
+        scored_tokens.append(token_str)
+        is_special_flags.append(is_special)
+    
+    surprisals = [float("nan")] * seq_len
+    entropies = [float("nan")] * seq_len
+    pred_columns: List[List[str]] = [[] for _ in range(seq_len)]
+    
+    # Fill values from each variant at its target position
+    for variant_idx, (sent_pos, combined_pos) in enumerate(variant_targets):
+        target_id = int(sentence_ids[sent_pos].item())
+        logits = logits_batch[variant_idx, combined_pos]
+        surp, ent = compute_surprisal_entropy(logits, target_id)  # returns bits
+        top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
+        
+        surprisals[sent_pos] = surp
+        entropies[sent_pos] = ent
+        pred_columns[sent_pos] = top_k_tokens
     
     return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
 
@@ -496,7 +596,8 @@ def process_sentences(
     beam_width: int = 3,
     doc_ids: List[str] = None,
     sentence_ids: List[str] = None,
-    progress: bool = True
+    progress: bool = True,
+    pll_metric: str = 'original'  # <- added
 ) -> List[dict]:
     """
     Process sentences and return results as list of dicts.
@@ -530,7 +631,7 @@ def process_sentences(
         raise ValueError("doc_ids and sentence_ids must match length of sentences")
     
     # Load model
-    print(f"Loading {mode.upper()} model: {model_name}")
+    print(f"Loading {mode.upper()} model: {model_name}")  # keep previous behavior if present
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Pre-tokenize context once
@@ -544,7 +645,10 @@ def process_sentences(
         )
     elif mode == 'mlm':
         model = AutoModelForMaskedLM.from_pretrained(model_name)
-        score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
+        if pll_metric == 'within_word_l2r':
+            score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids)
+        else:
+            score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
     
@@ -602,7 +706,8 @@ def process_from_file(
     top_k: int = 5,
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
-    beam_width: int = 3
+    beam_width: int = 3,
+    pll_metric: str = 'original'  # <- added
 ):
     """
     Process input TSV file and write output TSV file.
@@ -633,7 +738,8 @@ def process_from_file(
         beam_width=beam_width,
         doc_ids=doc_ids,
         sentence_ids=sentence_ids,
-        progress=True
+        progress=True,
+        pll_metric=pll_metric  # <- added
     )
     
     # Write output
@@ -655,9 +761,9 @@ def main():
     parser.add_argument('--lookahead_strategy', choices=['greedy', 'beam'], default='greedy', 
                        help='AR: lookahead strategy (greedy or beam search)')
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search')
-    
+    parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
+                        default='original', help='MLM PLL variant (default: original)')
     args = parser.parse_args()
-    
     process_from_file(
         input_file=args.input_file,
         output_file=args.output_file,
@@ -668,9 +774,6 @@ def main():
         top_k=args.top_k,
         lookahead_n=args.lookahead_n,
         lookahead_strategy=args.lookahead_strategy,
-        beam_width=args.beam_width
+        beam_width=args.beam_width,
+        pll_metric=args.pll_metric  # <- added
     )
-
-
-if __name__ == '__main__':
-    main()
