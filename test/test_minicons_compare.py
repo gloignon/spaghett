@@ -48,18 +48,19 @@ def compute_with_scorer(texts: List[str], model_name: str, mode: str, pll_metric
     import importlib
     
     try:
-        scorer = importlib.import_module("scorer")
+        # Import from utils instead of scorer
+        utils = importlib.import_module("utils")
     except Exception as e:
-        raise RuntimeError(f"Failed to import scorer.py: {e}")
+        raise RuntimeError(f"Failed to import utils.py: {e}")
     
-    if not hasattr(scorer, "process_sentences"):
+    if not hasattr(utils, "process_sentences"):
         raise RuntimeError(
-            "scorer.py does not export process_sentences(). "
-            "Please ensure your scorer.py has this function."
+            "utils.py does not export process_sentences(). "
+            "Please ensure your utils.py has this function."
         )
     
-    # Call process_sentences
-    results = scorer.process_sentences(
+    # Call process_sentences from utils
+    results = utils.process_sentences(
         sentences=texts,
         mode=mode,
         model_name=model_name,
