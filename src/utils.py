@@ -5,22 +5,25 @@ and exporting the top-k most probable next tokens for each scored token.
 
 CLI parameters:
     --input_file: Path to the input TSV file with documents or sentences.
-    --output_file: Path to the output TSV file (default: will create one based on input file and timestamp). You can also provide a folder path for the output file, and it will create a timestamped file inside that folder. 
+    --output_file: Path to the output TSV file (default: will create one based on input file and timestamp). 
+                   You can also provide a folder path for the output file, and it will create a timestamped file inside that folder. 
     --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
     --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
     --format: 'documents' or 'sentences' to specify input format.
     --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
-    --top_k: Number of top probable tokens to output (default: 5).
-    --lookahead_n: (AR only) Number of follow tokens to generate (default: 3).
+    --top_k: Number of top probable tokens to output (default: 3). Set to 0 to disable.
+    --lookahead_n: (AR only) Number of follow tokens to generate (default: 3). Set to 0 to disable.
     --lookahead_strategy: (AR only) Strategy for generating follow tokens: 'greedy' or 'beam' (default: greedy).
     --beam_width: (AR only) Beam width for beam search (default: 3, only used when --lookahead_strategy=beam).
     --pll_metric: (MLM only) PLL variant to use: 'original' for original PLL, 'within_word_l2r' for within-word left-to-right scoring (default: original).
+    --output_attentions: Output attention matrices to separate TSV file (*_attention.tsv). Includes full attention scores between all tokens.
+    --just_attentions: ONLY extract attention matrices (no surprisal/entropy/predictions). Faster mode that skips all scoring and outputs only attention TSV.
 
 Input TSV formats:
     - documents: doc_id<TAB>text (with header)
     - sentences: doc_id<TAB>sentence_id<TAB>sentence (with header)
 
-Output TSV columns:
+Output TSV columns (main results file):
     doc_id (str): 
         Document identifier from input file.
     
@@ -31,7 +34,7 @@ Output TSV columns:
         Position of the token within the sentence (1-indexed).
     
     token (str): 
-        The actual token text
+        The actual token text as produced by the tokenizer (may include special characters like Ġ or ▁).
 
     token_decoded (str):
         Human-readable decoded token text (e.g., "Il" instead of "▁Il" or "<s>").
@@ -68,16 +71,75 @@ Output TSV columns:
             - 'greedy': selects highest probability token at each step
             - 'beam': uses beam search to find most probable sequence
         Useful for understanding what word/phrase the model expects to follow.
+
+Output TSV columns (attention file, when --output_attentions or --just_attentions is used):
+    doc_id (str):
+        Document identifier from input file.
+    
+    sentence_id (str):
+        Sentence identifier within the document.
+    
+    token_id (int):
+        Position of the source token in the sequence (1-indexed).
+        Includes both context tokens (if --left_context_file provided) and sentence tokens.
+    
+    token (str):
+        The source token text as produced by the tokenizer.
+    
+    is_context (int):
+        Flag indicating if the source token is from left context (1) or from the sentence (0).
+        Only relevant when --left_context_file is provided.
+    
+    is_special (int):
+        Flag indicating if the source token is a special token (1) or regular token (0).
+    
+    rx_token_id (int):
+        Position of the target token receiving attention (1-indexed).
+    
+    rx_token (str):
+        The target token text as produced by the tokenizer.
+    
+    attn_score (float):
+        Attention weight from source token to target token (averaged across all layers and heads).
+        Values are between 0 and 1. For each source token, attention weights sum to ~1.0 across all targets.
+
 Notes:
     - The general philosophy is "fix it in post-processing" rather than complicating the scoring code.
     - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc) when the model produces them.
-    - In AR mode we also compute surprisal and entropy for the fist token if no prior context is provided. Filter out if undesired.
-    - Don't want special tokens? You can also filter them out easily using the is_special column in post-processing.
+    - In AR mode we also compute surprisal and entropy for the first token if no prior context is provided. Filter out if undesired.
+    - Don't want special tokens? You can filter them out easily using the is_special column in post-processing.
     - We avoid making assumptions about special characters in tokenization (e.g., "Ġ" vs "▁") and output both raw and decoded forms.
     - Designed for simplicity and robustness over performance (limited batching, no GPU acceleration).
     - Surprisal and entropy are in bits (log base 2).
     - For MLM, we use parallel masking (one forward pass with all tokens masked) for efficiency. AR has no batching for now.
+    - Attention extraction (--output_attentions):
+        * Extracts averaged attention weights across all layers and all attention heads.
+        * Includes attention between ALL tokens (context + sentence) when left context is provided.
+        * Each source token's attention weights sum to ~1.0 across all target tokens.
+        * Matrix size: (N_context + N_sentence) × (N_context + N_sentence) entries per sentence.
+        * Use is_context=0 to filter for sentence-only attention patterns.
+    - Fast attention-only mode (--just_attentions):
+        * Skips all surprisal, entropy, and prediction calculations.
+        * Only performs forward pass to extract attention weights.
+        * Significantly faster when you only need attention patterns.
+        * Outputs only the attention TSV file (no main results file).
+        * Automatically sets top_k=0 and lookahead_n=0.
 
+Examples:
+    # Standard scoring with GPT-2
+    python utils.py --input_file data.tsv --mode ar --model gpt2
+    
+    # Extract attention alongside scoring
+    python utils.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
+    
+    # Extract ONLY attention (no scoring, faster)
+    python utils.py --input_file data.tsv --mode mlm --model bert-base-uncased --just_attentions
+    
+    # With left context (attention will include context tokens)
+    python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions --left_context_file context.txt
+    
+    # Full scoring with all features
+    python utils.py --input_file data.tsv --mode ar --model gpt2 --top_k 10 --lookahead_n 5 --output_attentions
 """
 
 import argparse
@@ -111,6 +173,7 @@ class ScoringConfig:
     top_k: int = 3
     lookahead_n: int = 3  # Default for AR, will be adjusted in __post_init__
     beam_width: int = 3
+    just_attentions: bool = False
 
     _VALID_MODES = frozenset({'ar', 'mlm'})
     _VALID_STRATEGIES = frozenset({'greedy', 'beam'})
@@ -127,6 +190,11 @@ class ScoringConfig:
         # Similarly for lookahead_strategy
         if self.mode == 'mlm' and self.lookahead_strategy != 'greedy':
             object.__setattr__(self, 'lookahead_strategy', 'greedy')
+        
+        # If just_attentions is True, disable all scoring features
+        if self.just_attentions:
+            object.__setattr__(self, 'top_k', 0)
+            object.__setattr__(self, 'lookahead_n', 0)
 
     def validate(self) -> None:
         errors = []
@@ -153,20 +221,17 @@ class ScoringConfig:
             # Beam search requires beam_width
             if self.lookahead_strategy == 'beam' and self.beam_width < 1:
                 errors.append(f"beam_width must be >= 1 when using beam search, got {self.beam_width}")
-        else:  # MLM mode
-            # MLM mode: top_k must be >= 1
-            if self.top_k < 1:
-                errors.append(f"top_k must be >= 1 in MLM mode, got {self.top_k}")
-        
+
         # Warnings (don't block execution, just inform)
-        if self.mode == 'ar' and self.lookahead_strategy == 'beam' and self.beam_width > self.top_k and self.top_k > 0:
-            print(f"Warning: beam_width ({self.beam_width}) > top_k ({self.top_k}) may generate many sequences", file=sys.stderr)
-        
-        if self.top_k > 50:
-            print(f"Warning: top_k ({self.top_k}) is quite large, this may slow down processing", file=sys.stderr)
-        
-        if self.lookahead_n > 20:
-            print(f"Warning: lookahead_n ({self.lookahead_n}) is quite large, this may slow down processing", file=sys.stderr)
+        if not self.just_attentions:
+            if self.mode == 'ar' and self.lookahead_strategy == 'beam' and self.beam_width > self.top_k and self.top_k > 0:
+                print(f"Warning: beam_width ({self.beam_width}) > top_k ({self.top_k}) may generate many sequences", file=sys.stderr)
+            
+            if self.top_k > 50:
+                print(f"Warning: top_k ({self.top_k}) is quite large, this may slow down processing", file=sys.stderr)
+            
+            if self.lookahead_n > 20:
+                print(f"Warning: lookahead_n ({self.lookahead_n}) is quite large, this may slow down processing", file=sys.stderr)
         
         if errors:
             bullet = "\n  • ".join(errors)
@@ -327,6 +392,19 @@ def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n:
         writer.writerows(results)
 
 
+def write_attention_output(output_file: str, attention_data: List[dict]):
+    """Write attention tuples to TSV."""
+    if not attention_data:
+        return
+    
+    columns = ['doc_id', 'sentence_id', 'token_id', 'token', 'is_context', 'is_special', 'rx_token_id', 'rx_token', 'attn_score']
+    
+    with open(output_file, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(attention_data)
+
+
 # ============================================================================
 # Core processing function (I/O independent)
 # ============================================================================
@@ -343,8 +421,16 @@ def process_sentences(
     doc_ids: List[str] = None,
     sentence_ids: List[str] = None,
     progress: bool = True,
-    pll_metric: str = 'original'
-) -> List[dict]:
+    pll_metric: str = 'original',
+    output_attentions: bool = False,
+    just_attentions: bool = False
+) -> Tuple[List[dict], List[dict]]:
+    # Override parameters if just_attentions is True
+    if just_attentions:
+        output_attentions = True
+        top_k = 0
+        lookahead_n = 0
+    
     config = ScoringConfig(
         mode=mode,
         model_name=model_name,
@@ -352,9 +438,11 @@ def process_sentences(
         lookahead_n=lookahead_n,
         lookahead_strategy=lookahead_strategy,
         beam_width=beam_width,
-        pll_metric=pll_metric
+        pll_metric=pll_metric,
+        just_attentions=just_attentions
     )
     config.validate()
+    
     # Auto-generate IDs if not provided
     if doc_ids is None:
         doc_ids = ['doc1'] * len(sentences)
@@ -365,7 +453,10 @@ def process_sentences(
         raise ValueError("doc_ids and sentence_ids must match length of sentences")
     
     # Load model with error handling
-    print(f"Loading {mode.upper()} model: {model_name}")
+    if just_attentions:
+        print(f"Loading {mode.upper()} model for attention extraction: {model_name}")
+    else:
+        print(f"Loading {mode.upper()} model: {model_name}")
     
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -384,14 +475,14 @@ def process_sentences(
             model = AutoModelForCausalLM.from_pretrained(model_name)
             score_fn = lambda s: score_autoregressive(
                 s, left_context, tokenizer, model, top_k, lookahead_n,
-                lookahead_strategy, beam_width, context_ids
+                lookahead_strategy, beam_width, context_ids, output_attentions
             )
         elif mode == 'mlm':
             model = AutoModelForMaskedLM.from_pretrained(model_name)
             if pll_metric == 'within_word_l2r':
-                score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids)
+                score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids, output_attentions)
             else:
-                score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids)
+                score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids, output_attentions)
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
     except Exception as e:
@@ -408,40 +499,59 @@ def process_sentences(
     
     # Process sentences
     results = []
+    attention_results = []
     iterator = zip(doc_ids, sentence_ids, sentences)
     if progress:
-        iterator = tqdm(iterator, total=len(sentences), desc="Processing")
+        desc = "Extracting attention" if just_attentions else "Processing"
+        iterator = tqdm(iterator, total=len(sentences), desc=desc)
     
     for doc_id, sent_id, sentence in iterator:
-        raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols = score_fn(sentence)
+        raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols, attn_tuples = score_fn(sentence)
         
-        for idx, (raw_token, token, is_special, surp, ent, preds) in enumerate(
-            zip(raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols), 1
-        ):
-            row = {
-                'doc_id': doc_id,
-                'sentence_id': sent_id,
-                'token_index': idx,
-                'token': raw_token,
-                'token_decoded': token,
-                'is_special': is_special,
-                'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
-                'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
-            }
-            
-            # Add top-k columns
-            for i in range(1, top_k + 1):
-                row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
-            
-            # Add lookahead columns (AR only)
-            if mode == 'ar':
-                offset = top_k
-                for i in range(1, lookahead_n + 1):
-                    row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
-            
-            results.append(row)
+        # Only populate results if not just_attentions
+        if not just_attentions:
+            for idx, (raw_token, token, is_special, surp, ent, preds) in enumerate(
+                zip(raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols), 1
+            ):
+                row = {
+                    'doc_id': doc_id,
+                    'sentence_id': sent_id,
+                    'token_index': idx,
+                    'token': raw_token,
+                    'token_decoded': token,
+                    'is_special': is_special,
+                    'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
+                    'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
+                }
+                
+                # Add top-k columns
+                for i in range(1, top_k + 1):
+                    row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
+                
+                # Add lookahead columns (AR only)
+                if mode == 'ar':
+                    offset = top_k
+                    for i in range(1, lookahead_n + 1):
+                        row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+                
+                results.append(row)
+        
+        # Process attention data if available
+        if attn_tuples is not None:
+            for token_id, token, is_context, is_special, rx_token_id, rx_token, weight in attn_tuples:
+                attention_results.append({
+                    'doc_id': doc_id,
+                    'sentence_id': sent_id,
+                    'token_id': token_id,
+                    'token': token,
+                    'is_context': is_context,
+                    'is_special': is_special,
+                    'rx_token_id': rx_token_id,
+                    'rx_token': rx_token,
+                    'attn_score': f'{weight:.6f}'
+                })
     
-    return results
+    return results, attention_results
 
 
 # ============================================================================
@@ -459,7 +569,9 @@ def process_from_file(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    pll_metric: str = 'original'
+    pll_metric: str = 'original',
+    output_attentions: bool = False,
+    just_attentions: bool = False
 ):
     """
     Process input TSV file and write output TSV file.
@@ -491,7 +603,7 @@ def process_from_file(
         sentences = [item[2] for item in data]
         
         # Process using core function
-        results = process_sentences(
+        results, attention_results = process_sentences(
             sentences=sentences,
             mode=mode,
             model_name=model_name,
@@ -503,12 +615,29 @@ def process_from_file(
             doc_ids=doc_ids,
             sentence_ids=sentence_ids,
             progress=True,
-            pll_metric=pll_metric
+            pll_metric=pll_metric,
+            output_attentions=output_attentions,
+            just_attentions=just_attentions
         )
         
-        # Write output
-        write_output(output_file, results, top_k, lookahead_n, mode)
-        print(f"Results written to: {output_file}")
+        # Write output only if not just_attentions
+        if not just_attentions:
+            write_output(output_file, results, top_k, lookahead_n, mode)
+            print(f"Results written to: {output_file}")
+        
+        # Write attention output if requested or if just_attentions
+        if (output_attentions or just_attentions) and attention_results:
+            # Create attention filename
+            if just_attentions:
+                # For just_attentions, use the output_file directly as attention file
+                attn_file = Path(output_file)
+            else:
+                # For normal mode with attentions, append _attention to filename
+                base_path = Path(output_file)
+                attn_file = base_path.parent / (base_path.stem + '_attention' + base_path.suffix)
+            
+            write_attention_output(str(attn_file), attention_results)
+            print(f"Attention scores written to: {attn_file}")
         
     except FileNotFoundError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
@@ -534,6 +663,12 @@ def main():
 Examples:
   # Score sentences with GPT-2 (autoregressive)
   python scorer.py --input_file data.tsv --mode ar --model gpt2
+  
+  # Score with attention output
+  python scorer.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
+  
+  # Extract ONLY attention (no scoring)
+  python scorer.py --input_file data.tsv --mode ar --model gpt2 --just_attentions
   
   # Score documents with BERT (masked LM)
   python scorer.py --input_file docs.tsv --mode mlm --model bert-base-uncased --format documents
@@ -569,6 +704,10 @@ For more information, see the documentation at the top of this file.
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    parser.add_argument('--output_attentions', action='store_true', 
+                       help='Output attention matrices to separate TSV file (creates *_attention.tsv)')
+    parser.add_argument('--just_attentions', action='store_true',
+                       help='ONLY extract attention matrices (no surprisal/entropy/predictions). Faster and creates only attention TSV.')
     
     # Check if no arguments provided
     if len(sys.argv) == 1:
@@ -588,7 +727,8 @@ For more information, see the documentation at the top of this file.
             lookahead_n=args.lookahead_n,
             lookahead_strategy=args.lookahead_strategy,
             beam_width=args.beam_width,
-            pll_metric=args.pll_metric
+            pll_metric=args.pll_metric,
+            just_attentions=args.just_attentions
         ).validate()
     except ValueError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
@@ -597,16 +737,24 @@ For more information, see the documentation at the top of this file.
     # Build filename parts
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
-    parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
     
-    if args.left_context_file:
+    if args.just_attentions:
+        # Simpler filename for just_attentions mode
+        parts = [Path(args.input_file).stem, args.mode, model_short, 'attention']
+    else:
+        parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
+        
+        if args.left_context_file:
+            parts.append('extra')
+        if args.mode == 'ar' and args.lookahead_n > 0:
+            parts.append(f'look{args.lookahead_n}')
+            if args.lookahead_strategy == 'beam':
+                parts.append(f'beam{args.beam_width}')
+        if args.pll_metric == 'within_word_l2r':
+            parts.append('L2R')
+    
+    if args.left_context_file and args.just_attentions:
         parts.append('extra')
-    if args.mode == 'ar' and args.lookahead_n > 0:
-        parts.append(f'look{args.lookahead_n}')
-        if args.lookahead_strategy == 'beam':
-            parts.append(f'beam{args.beam_width}')
-    if args.pll_metric == 'within_word_l2r':
-        parts.append('L2R')
     
     parts.append(timestamp)
     generated_filename = '_'.join(parts) + '.tsv'
@@ -640,7 +788,9 @@ For more information, see the documentation at the top of this file.
         lookahead_n=args.lookahead_n,
         lookahead_strategy=args.lookahead_strategy,
         beam_width=args.beam_width,
-        pll_metric=args.pll_metric
+        pll_metric=args.pll_metric,
+        output_attentions=args.output_attentions,
+        just_attentions=args.just_attentions
     )
 
 if __name__ == "__main__":

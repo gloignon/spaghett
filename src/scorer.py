@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 
@@ -65,6 +65,71 @@ def decode_token(tokenizer, token_id: int, is_special: bool) -> Tuple[str, str]:
     return raw_token, decoded_token
 
 
+def extract_attention_tuples(
+    attention_weights: torch.Tensor,
+    tokenizer,
+    full_token_ids: torch.Tensor,
+    sentence_start: int,
+    sentence_length: int
+) -> List[Tuple[int, str, int, int, int, str, float]]:
+    """
+    Extract attention weights as tuples including context tokens.
+    
+    Args:
+        attention_weights: Tensor of shape (num_layers, num_heads, seq_len, seq_len)
+                          or (num_heads, seq_len, seq_len) if single layer
+        tokenizer: Tokenizer to identify special tokens and decode tokens
+        full_token_ids: Full sequence of token IDs (context + sentence)
+        sentence_start: Start position of sentence in sequence
+        sentence_length: Number of tokens in sentence
+    
+    Returns:
+        List of (token_idx, token_str, is_context, is_special, rx_token_idx, rx_token_str, weight)
+        where token_idx is 1-indexed position in full sequence
+    """
+    # Handle both single-layer and multi-layer attention
+    if attention_weights.dim() == 4:
+        # Average across layers and heads: (layers, heads, seq, seq) -> (seq, seq)
+        attn = attention_weights.mean(dim=(0, 1))
+    elif attention_weights.dim() == 3:
+        # Average across heads: (heads, seq, seq) -> (seq, seq)
+        attn = attention_weights.mean(dim=0)
+    else:
+        raise ValueError(f"Unexpected attention shape: {attention_weights.shape}")
+    
+    seq_len = len(full_token_ids)
+    special_mask = tokenizer.get_special_tokens_mask(
+        full_token_ids.tolist(), 
+        already_has_special_tokens=True
+    )
+    
+    # Convert all token IDs to strings (raw tokens with special characters)
+    token_strings = tokenizer.convert_ids_to_tokens(full_token_ids.tolist())
+    
+    # Convert to tuples (token_idx, token_str, is_context, is_special, rx_token_idx, rx_token_str, weight)
+    tuples = []
+    for src_idx in range(seq_len):
+        is_context_src = 1 if src_idx < sentence_start else 0
+        is_special_src = special_mask[src_idx]
+        src_token = token_strings[src_idx]
+        
+        for tgt_idx in range(seq_len):
+            tgt_token = token_strings[tgt_idx]
+            weight = attn[src_idx, tgt_idx].item()
+            # 1-indexed token positions
+            tuples.append((
+                src_idx + 1,      # token_id (1-indexed)
+                src_token,        # token string
+                is_context_src,   # is_context
+                is_special_src,   # is_special
+                tgt_idx + 1,      # rx_token_id (1-indexed)
+                tgt_token,        # rx_token string
+                weight            # attn_score
+            ))
+    
+    return tuples
+
+
 # ============================================================================
 # Core scoring functions
 # ============================================================================
@@ -77,8 +142,9 @@ def score_autoregressive(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    context_ids: List[int] = None
-) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
+    context_ids: List[int] = None,
+    output_attentions: bool = False
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]], Optional[List[Tuple[int, str, int, int, int, str, float]]]]:
     """
     Score sentence with AR model.
 
@@ -90,26 +156,40 @@ def score_autoregressive(
             - List[float]: Surprisal values (in bits) for each token.
             - List[float]: Entropy values (in bits) for each token.
             - List[List[str]]: For each token, a list containing the most probable token, top-k predictions, and lookahead tokens.
+            - Optional[List[Tuple[...]]]: Attention tuples (token_id, token, is_context, is_special, rx_token_id, rx_token, weight)
     """
     # Handle empty or whitespace-only sentences
     if not sentence or not sentence.strip():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
     
     if not sentence_ids.numel():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Prepare input with context
     input_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
-    # Get logits for the full sequence
+    # Get logits (and optionally attention) for the full sequence
     with torch.no_grad():
-        outputs = model(input_ids.unsqueeze(0))
+        outputs = model(input_ids.unsqueeze(0), output_attentions=output_attentions)
         logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
+    
+    # Extract attention if requested
+    attention_tuples = None
+    if output_attentions and outputs.attentions is not None:
+        # Stack all layers: (num_layers, batch, num_heads, seq_len, seq_len)
+        all_attentions = torch.stack(outputs.attentions)[:, 0, :, :, :]  # Remove batch dim
+        attention_tuples = extract_attention_tuples(
+            all_attentions,
+            tokenizer,
+            input_ids,
+            sentence_start,
+            len(sentence_ids)
+        )
     
     # Score each token
     raw_tokens = []
@@ -176,7 +256,7 @@ def score_autoregressive(
         entropies.append(entropy)
         pred_columns.append(pred_col)
     
-    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns, attention_tuples
 
 
 def score_masked_lm(
@@ -184,8 +264,9 @@ def score_masked_lm(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
-) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
+    context_ids: List[int] = None,
+    output_attentions: bool = False
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]], Optional[List[Tuple[int, str, int, int, int, str, float]]]]:
     """
     Score sentence with MLM using parallel masking (original PLL).
     """
@@ -194,20 +275,35 @@ def score_masked_lm(
     
     # Handle empty or whitespace-only sentences
     if not sentence or not sentence.strip():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
     sentence_ids = encoding["input_ids"][0]
     
     if not sentence_ids.numel():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Prepare input with context
     base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
     
     num_tokens = len(sentence_ids)
+    
+    # For attention extraction, we'll use the unmasked input
+    attention_tuples = None
+    if output_attentions:
+        with torch.no_grad():
+            attn_outputs = model(base_ids.unsqueeze(0), output_attentions=True)
+            if attn_outputs.attentions is not None:
+                all_attentions = torch.stack(attn_outputs.attentions)[:, 0, :, :, :]
+                attention_tuples = extract_attention_tuples(
+                    all_attentions,
+                    tokenizer,
+                    base_ids,
+                    sentence_start,
+                    num_tokens
+                )
     
     # Create ALL masked versions at once (mask current token only)
     masked_batch = []
@@ -245,7 +341,7 @@ def score_masked_lm(
         entropies.append(entropy)
         pred_columns.append(top_k_tokens)
     
-    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns, attention_tuples
 
 
 def score_masked_lm_l2r(
@@ -253,32 +349,44 @@ def score_masked_lm_l2r(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
-) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]]]:
+    context_ids: List[int] = None,
+    output_attentions: bool = False
+) -> Tuple[List[str], List[str], List[int], List[float], List[float], List[List[str]], Optional[List[Tuple[int, str, int, int, int, str, float]]]]:
     """
-    Score sentence with MLM using within_word_l2r (minicons-compatible):
-    - For each word (group of subtokens), predict subtokens left-to-right.
-    - For subtoken k in a word, mask the current subtoken and all future subtokens
-      in that word; keep previous subtokens and all other tokens visible.
-    - Special tokens are scored by masking only themselves.
+    Score sentence with MLM using within_word_l2r (minicons-compatible).
     """
     if tokenizer.mask_token_id is None:
         raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
     
     # Handle empty or whitespace-only sentences
     if not sentence or not sentence.strip():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Tokenize sentence
     encoding = tokenizer(sentence, return_tensors="pt", add_special_tokens=True)
-    sentence_ids = encoding["input_ids"][0]  # (seq_len,)
+    sentence_ids = encoding["input_ids"][0]
     if not sentence_ids.numel():
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     # Base + left context
     base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
     seq_len = len(sentence_ids)
     special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
+    
+    # For attention extraction, use unmasked input
+    attention_tuples = None
+    if output_attentions:
+        with torch.no_grad():
+            attn_outputs = model(base_ids.unsqueeze(0), output_attentions=True)
+            if attn_outputs.attentions is not None:
+                all_attentions = torch.stack(attn_outputs.attentions)[:, 0, :, :, :]
+                attention_tuples = extract_attention_tuples(
+                    all_attentions,
+                    tokenizer,
+                    base_ids,
+                    sentence_start,
+                    seq_len
+                )
     
     # Word alignment (requires fast tokenizer)
     if getattr(tokenizer, "is_fast", False) and hasattr(encoding, "word_ids"):
@@ -323,7 +431,7 @@ def score_masked_lm_l2r(
             variant_targets.append((sent_pos, combined_pos))
     
     if not masked_variants:
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], None if output_attentions else []
     
     batch = torch.stack(masked_variants)  # (num_variants == seq_len, seq_total_len)
     with torch.no_grad():
@@ -355,7 +463,7 @@ def score_masked_lm_l2r(
         entropies[sent_pos] = ent
         pred_columns[sent_pos] = top_k_tokens
     
-    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns
+    return raw_tokens, scored_tokens, is_special_flags, surprisals, entropies, pred_columns, attention_tuples
 
 
 
