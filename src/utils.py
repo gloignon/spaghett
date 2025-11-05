@@ -614,24 +614,6 @@ For more information, see the documentation at the top of this file.
     
     args = parser.parse_args()
 
-    # Validate parameters using ScoringConfig
-    try:
-        ScoringConfig(
-            mode=args.mode,
-            model_name=args.model,
-            top_k=args.top_k,
-            lookahead_n=args.lookahead_n,
-            lookahead_strategy=args.lookahead_strategy,
-            beam_width=args.beam_width,
-            pll_metric=args.pll_metric,
-            just_attentions=args.just_attentions,
-            attention_layers=args.attention_layers,  # NEW
-            attention_heads=args.attention_heads     # NEW
-        ).validate()
-    except ValueError as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
     # Build filename parts
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
