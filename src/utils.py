@@ -551,11 +551,16 @@ Examples:
   # Score sentences with GPT-2 (autoregressive)
   python utils.py --input_file data.tsv --mode ar --model gpt2
   
-  # Score with attention output
+  # Score with attention output (last layer, all heads averaged)
   python utils.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
   
-  # Extract ONLY attention (no scoring)
-  python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions
+  # Extract ONLY attention from specific layers and heads
+  python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions \\
+                   --attention_layers 0 5 11 --attention_heads 0 3 7
+  
+  # Extract attention from last layer only, specific heads
+  python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions \\
+                   --attention_heads 2 5
   
   # Score documents with BERT (masked LM)
   python utils.py --input_file docs.tsv --mode mlm --model bert-base-uncased --format documents
@@ -596,9 +601,9 @@ For more information, see the documentation at the top of this file.
     parser.add_argument('--just_attentions', action='store_true',
                        help='ONLY extract attention matrices (no surprisal/entropy/predictions). Faster and creates only attention TSV.')
     parser.add_argument('--attention_layers', type=int, nargs='+', default=None,
-                        help='Specific layer indices to extract attention from (0-indexed). Default: all layers (averaged)')  # NEW
+                        help='Specific layer indices to extract attention from (0-indexed). Default: last layer only')
     parser.add_argument('--attention_heads', type=int, nargs='+', default=None,
-                        help='Specific attention head indices to extract (0-indexed). Default: all heads (averaged)')        # NEW
+                        help='Specific attention head indices to extract (0-indexed). Default: all heads (averaged)')
 
     # Check if no arguments provided
     if len(sys.argv) == 1:

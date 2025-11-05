@@ -15,39 +15,45 @@ def extract_attention_tuples(
 
     Args:
         attention_weights: Tensor of shape (num_layers, num_heads, seq_len, seq_len)
-                           or (num_heads, seq_len, seq_len) if single layer
         tokenizer: Tokenizer to identify special tokens and decode tokens
         full_token_ids: Full sequence of token IDs (context + sentence)
         sentence_start: Start position of sentence in sequence
         sentence_length: Number of tokens in sentence
-        selected_layers: List of layer indices to use (None = all layers averaged)
+        selected_layers: List of layer indices to use (None = last layer only)
         selected_heads: List of head indices to use (None = all heads averaged)
 
     Returns:
         List of (token_idx, token_str, is_context, is_special, rx_token_idx, rx_token_str, weight)
         where token_idx is 1-indexed position in full sequence
     """
-    # Handle both single-layer and multi-layer attention
-    if attention_weights.dim() == 4:
-        num_layers, num_heads, seq_len, _ = attention_weights.shape
-        # Average over selected layers
-        if selected_layers:
-            layer_weights = attention_weights[selected_layers]
-        else:
-            layer_weights = attention_weights
-        avg_over_layers = layer_weights.mean(dim=0)  # (num_heads, seq_len, seq_len)
-    elif attention_weights.dim() == 3:
-        num_heads, seq_len, _ = attention_weights.shape
-        avg_over_layers = attention_weights
+    if attention_weights.dim() != 4:
+        raise ValueError(f"Expected attention_weights to have 4 dimensions (layers, heads, seq, seq), got {attention_weights.dim()}")
+    
+    num_layers, num_heads, seq_len, _ = attention_weights.shape
+    
+    # Select layers: default to last layer
+    if selected_layers is None:
+        selected_layers = [num_layers - 1]
     else:
-        raise ValueError(f"Expected attention_weights to have 3 or 4 dimensions, got {attention_weights.dim()}")
-
-    # Average over selected heads
-    if selected_heads:
-        head_weights = avg_over_layers[selected_heads]
+        # Validate layer indices
+        for layer in selected_layers:
+            if layer < 0 or layer >= num_layers:
+                raise ValueError(f"Layer index {layer} out of range [0, {num_layers-1}]")
+    
+    # Average over selected layers
+    layer_weights = attention_weights[selected_layers].mean(dim=0)  # (num_heads, seq_len, seq_len)
+    
+    # Select heads: default to average all heads
+    if selected_heads is None:
+        # Average all heads
+        avg_attention = layer_weights.mean(dim=0)  # (seq_len, seq_len)
     else:
-        head_weights = avg_over_layers
-    avg_attention = head_weights.mean(dim=0)  # (seq_len, seq_len)
+        # Validate head indices
+        for head in selected_heads:
+            if head < 0 or head >= num_heads:
+                raise ValueError(f"Head index {head} out of range [0, {num_heads-1}]")
+        # Average selected heads
+        avg_attention = layer_weights[selected_heads].mean(dim=0)  # (seq_len, seq_len)
 
     seq_len = len(full_token_ids)
     special_mask = tokenizer.get_special_tokens_mask(
