@@ -2,144 +2,6 @@
 """
 Simple script for computing per-token surprisal and entropy, by sentence, with extra left context,
 and exporting the top-k most probable next tokens for each scored token.
-
-CLI parameters:
-    --input_file: Path to the input TSV file with documents or sentences.
-    --output_file: Path to the output TSV file (default: will create one based on input file and timestamp). 
-                   You can also provide a folder path for the output file, and it will create a timestamped file inside that folder. 
-    --mode: 'ar' for autoregressive (GPT-style) or 'mlm' for masked language model (BERT-style).
-    --model: Name of the pre-trained model to use (e.g., 'gpt2', 'bert-base-uncased').
-    --format: 'documents' or 'sentences' to specify input format.
-    --left_context_file: Path to a .txt file whose contents are prepended to every sentence.
-    --top_k: Number of top probable tokens to output (default: 3). Set to 0 to disable.
-    --lookahead_n: (AR only) Number of follow tokens to generate (default: 3). Set to 0 to disable.
-    --lookahead_strategy: (AR only) Strategy for generating follow tokens: 'greedy' or 'beam' (default: greedy).
-    --beam_width: (AR only) Beam width for beam search (default: 3, only used when --lookahead_strategy=beam).
-    --pll_metric: (MLM only) PLL variant to use: 'original' for original PLL, 'within_word_l2r' for within-word left-to-right scoring (default: original).
-    --output_attentions: Output attention matrices to separate TSV file (*_attention.tsv). Includes full attention scores between all tokens.
-    --just_attentions: ONLY extract attention matrices (no surprisal/entropy/predictions). Faster mode that skips all scoring and outputs only attention TSV.
-
-Input TSV formats:
-    - documents: doc_id<TAB>text (with header)
-    - sentences: doc_id<TAB>sentence_id<TAB>sentence (with header)
-
-Output TSV columns (main results file):
-    doc_id (str): 
-        Document identifier from input file.
-    
-    sentence_id (str): 
-        Sentence identifier within the document. Auto-generated for 'documents' format.
-    
-    token_index (int): 
-        Position of the token within the sentence (1-indexed).
-    
-    token (str): 
-        The actual token text as produced by the tokenizer (may include special characters like Ġ or ▁).
-
-    token_decoded (str):
-        Human-readable decoded token text (e.g., "Il" instead of "▁Il" or "<s>").
-
-    is_special (int): 
-        Flag indicating if token is a special token (1) or regular content token (0).
-        Special tokens include BOS, EOS, CLS, SEP, PAD, MASK, etc.
-    
-    surprisal_bits (float): 
-        Surprisal value in bits: -log2(p(token|context)).
-        Measures how unexpected the token is given prior context.
-        Higher values = more surprising/unexpected.
-        Empty for first token in AR mode (no prior context to condition on).
-        AR mode: conditioned on all previous tokens.
-        MLM mode: conditioned on bidirectional context (all other tokens).
-    
-    entropy_bits (float): 
-        Shannon entropy of the probability distribution over all possible next tokens, in bits.
-        Measures uncertainty/predictability at this position.
-        Higher values = more uncertain/less predictable.
-        Empty for first token in AR mode.
-        Range: 0 (completely certain) to log2(vocab_size) (uniform distribution).
-    
-    pred_alt_1 through pred_alt_N (str): 
-        The N most probable tokens the model predicted would appear (instead of the current token), 
-        ranked by probability (1=highest).
-        Number of columns determined by --top_k parameter.
-        Useful for analyzing alternative predictions and model confidence.
-    
-    pred_next_1 through pred_next_M (str): 
-        (AR mode only) Continuation tokens generated from current position.
-        Number of columns determined by --lookahead_n parameter.
-        Generation strategy determined by --lookahead_strategy:
-            - 'greedy': selects highest probability token at each step
-            - 'beam': uses beam search to find most probable sequence
-        Useful for understanding what word/phrase the model expects to follow.
-
-Output TSV columns (attention file, when --output_attentions or --just_attentions is used):
-    doc_id (str):
-        Document identifier from input file.
-    
-    sentence_id (str):
-        Sentence identifier within the document.
-    
-    token_id (int):
-        Position of the source token in the sequence (1-indexed).
-        Includes both context tokens (if --left_context_file provided) and sentence tokens.
-    
-    token (str):
-        The source token text as produced by the tokenizer.
-    
-    is_context (int):
-        Flag indicating if the source token is from left context (1) or from the sentence (0).
-        Only relevant when --left_context_file is provided.
-    
-    is_special (int):
-        Flag indicating if the source token is a special token (1) or regular token (0).
-    
-    rx_token_id (int):
-        Position of the target token receiving attention (1-indexed).
-    
-    rx_token (str):
-        The target token text as produced by the tokenizer.
-    
-    attn_score (float):
-        Attention weight from source token to target token (averaged across all layers and heads).
-        Values are between 0 and 1. For each source token, attention weights sum to ~1.0 across all targets.
-
-Notes:
-    - The general philosophy is "fix it in post-processing" rather than complicating the scoring code.
-    - All tokens are scored, including special tokens (BOS/EOS/CLS/SEP/etc) when the model produces them.
-    - In AR mode we also compute surprisal and entropy for the first token if no prior context is provided. Filter out if undesired.
-    - Don't want special tokens? You can filter them out easily using the is_special column in post-processing.
-    - We avoid making assumptions about special characters in tokenization (e.g., "Ġ" vs "▁") and output both raw and decoded forms.
-    - Designed for simplicity and robustness over performance (limited batching, no GPU acceleration).
-    - Surprisal and entropy are in bits (log base 2).
-    - For MLM, we use parallel masking (one forward pass with all tokens masked) for efficiency. AR has no batching for now.
-    - Attention extraction (--output_attentions):
-        * Extracts averaged attention weights across all layers and all attention heads.
-        * Includes attention between ALL tokens (context + sentence) when left context is provided.
-        * Each source token's attention weights sum to ~1.0 across all target tokens.
-        * Matrix size: (N_context + N_sentence) × (N_context + N_sentence) entries per sentence.
-        * Use is_context=0 to filter for sentence-only attention patterns.
-    - Fast attention-only mode (--just_attentions):
-        * Skips all surprisal, entropy, and prediction calculations.
-        * Only performs forward pass to extract attention weights.
-        * Significantly faster when you only need attention patterns.
-        * Outputs only the attention TSV file (no main results file).
-        * Automatically sets top_k=0 and lookahead_n=0.
-
-Examples:
-    # Standard scoring with GPT-2
-    python utils.py --input_file data.tsv --mode ar --model gpt2
-    
-    # Extract attention alongside scoring
-    python utils.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
-    
-    # Extract ONLY attention (no scoring, faster)
-    python utils.py --input_file data.tsv --mode mlm --model bert-base-uncased --just_attentions
-    
-    # With left context (attention will include context tokens)
-    python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions --left_context_file context.txt
-    
-    # Full scoring with all features
-    python utils.py --input_file data.tsv --mode ar --model gpt2 --top_k 10 --lookahead_n 5 --output_attentions
 """
 
 import argparse
@@ -150,7 +12,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 import torch
@@ -174,6 +36,8 @@ class ScoringConfig:
     lookahead_n: int = 3  # Default for AR, will be adjusted in __post_init__
     beam_width: int = 3
     just_attentions: bool = False
+    attention_layers: Optional[List[int]] = None  # NEW: select layers (None = all)
+    attention_heads: Optional[List[int]] = None   # NEW: select heads (None = all)
 
     _VALID_MODES = frozenset({'ar', 'mlm'})
     _VALID_STRATEGIES = frozenset({'greedy', 'beam'})
@@ -213,6 +77,14 @@ class ScoringConfig:
         if self.pll_metric not in self._VALID_PLL:
             errors.append(f"pll_metric must be one of {sorted(self._VALID_PLL)}, got '{self.pll_metric}'")
         
+        # NEW: validate attention selections
+        if self.attention_layers is not None:
+            if not all(isinstance(x, int) and x >= 0 for x in self.attention_layers):
+                errors.append(f"attention_layers must be a list of non-negative integers, got {self.attention_layers}")
+        if self.attention_heads is not None:
+            if not all(isinstance(x, int) and x >= 0 for x in self.attention_heads):
+                errors.append(f"attention_heads must be a list of non-negative integers, got {self.attention_heads}")
+
         # Mode-specific validation
         if self.mode == 'ar':
             # AR mode: pll_metric not applicable
@@ -423,7 +295,9 @@ def process_sentences(
     progress: bool = True,
     pll_metric: str = 'original',
     output_attentions: bool = False,
-    just_attentions: bool = False
+    just_attentions: bool = False,
+    attention_layers: Optional[List[int]] = None,   # NEW
+    attention_heads: Optional[List[int]] = None     # NEW
 ) -> Tuple[List[dict], List[dict]]:
     # Override parameters if just_attentions is True
     if just_attentions:
@@ -439,7 +313,9 @@ def process_sentences(
         lookahead_strategy=lookahead_strategy,
         beam_width=beam_width,
         pll_metric=pll_metric,
-        just_attentions=just_attentions
+        just_attentions=just_attentions,
+        attention_layers=attention_layers,    # NEW
+        attention_heads=attention_heads       # NEW
     )
     config.validate()
     
@@ -475,14 +351,21 @@ def process_sentences(
             model = AutoModelForCausalLM.from_pretrained(model_name)
             score_fn = lambda s: score_autoregressive(
                 s, left_context, tokenizer, model, top_k, lookahead_n,
-                lookahead_strategy, beam_width, context_ids, output_attentions
+                lookahead_strategy, beam_width, context_ids, output_attentions,
+                attention_layers, attention_heads  # NEW
             )
         elif mode == 'mlm':
             model = AutoModelForMaskedLM.from_pretrained(model_name)
             if pll_metric == 'within_word_l2r':
-                score_fn = lambda s: score_masked_lm_l2r(s, tokenizer, model, top_k, context_ids, output_attentions)
+                score_fn = lambda s: score_masked_lm_l2r(
+                    s, tokenizer, model, top_k, context_ids, output_attentions,
+                    attention_layers, attention_heads  # NEW
+                )
             else:
-                score_fn = lambda s: score_masked_lm(s, tokenizer, model, top_k, context_ids, output_attentions)
+                score_fn = lambda s: score_masked_lm(
+                    s, tokenizer, model, top_k, context_ids, output_attentions,
+                    attention_layers, attention_heads  # NEW
+                )
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
     except Exception as e:
@@ -571,7 +454,9 @@ def process_from_file(
     beam_width: int = 3,
     pll_metric: str = 'original',
     output_attentions: bool = False,
-    just_attentions: bool = False
+    just_attentions: bool = False,
+    attention_layers: Optional[List[int]] = None,  # NEW
+    attention_heads: Optional[List[int]] = None    # NEW
 ):
     """
     Process input TSV file and write output TSV file.
@@ -617,7 +502,9 @@ def process_from_file(
             progress=True,
             pll_metric=pll_metric,
             output_attentions=output_attentions,
-            just_attentions=just_attentions
+            just_attentions=just_attentions,
+            attention_layers=attention_layers,    # NEW
+            attention_heads=attention_heads       # NEW
         )
         
         # Write output only if not just_attentions
@@ -662,26 +549,26 @@ def main():
         epilog="""
 Examples:
   # Score sentences with GPT-2 (autoregressive)
-  python scorer.py --input_file data.tsv --mode ar --model gpt2
+  python utils.py --input_file data.tsv --mode ar --model gpt2
   
   # Score with attention output
-  python scorer.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
+  python utils.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
   
   # Extract ONLY attention (no scoring)
-  python scorer.py --input_file data.tsv --mode ar --model gpt2 --just_attentions
+  python utils.py --input_file data.tsv --mode ar --model gpt2 --just_attentions
   
   # Score documents with BERT (masked LM)
-  python scorer.py --input_file docs.tsv --mode mlm --model bert-base-uncased --format documents
+  python utils.py --input_file docs.tsv --mode mlm --model bert-base-uncased --format documents
   
   # Output to folder (auto-generates filename)
-  python scorer.py --input_file data.tsv --mode ar --model gpt2 --output_file ./results/
+  python utils.py --input_file data.tsv --mode ar --model gpt2 --output_file ./results/
   
   # With custom output and context
-  python scorer.py --input_file data.tsv --output_file results.tsv --mode ar --model gpt2 \\
+  python utils.py --input_file data.tsv --output_file results.tsv --mode ar --model gpt2 \\
                    --left_context_file context.txt --top_k 10
   
   # With within-word L2R scoring (MLM only)
-  python scorer.py --input_file data.tsv --mode mlm --model bert-base-uncased \\
+  python utils.py --input_file data.tsv --mode mlm --model bert-base-uncased \\
                    --pll_metric within_word_l2r
 
 For more information, see the documentation at the top of this file.
@@ -708,7 +595,11 @@ For more information, see the documentation at the top of this file.
                        help='Output attention matrices to separate TSV file (creates *_attention.tsv)')
     parser.add_argument('--just_attentions', action='store_true',
                        help='ONLY extract attention matrices (no surprisal/entropy/predictions). Faster and creates only attention TSV.')
-    
+    parser.add_argument('--attention_layers', type=int, nargs='+', default=None,
+                        help='Specific layer indices to extract attention from (0-indexed). Default: all layers (averaged)')  # NEW
+    parser.add_argument('--attention_heads', type=int, nargs='+', default=None,
+                        help='Specific attention head indices to extract (0-indexed). Default: all heads (averaged)')        # NEW
+
     # Check if no arguments provided
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -728,7 +619,9 @@ For more information, see the documentation at the top of this file.
             lookahead_strategy=args.lookahead_strategy,
             beam_width=args.beam_width,
             pll_metric=args.pll_metric,
-            just_attentions=args.just_attentions
+            just_attentions=args.just_attentions,
+            attention_layers=args.attention_layers,  # NEW
+            attention_heads=args.attention_heads     # NEW
         ).validate()
     except ValueError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
@@ -739,11 +632,14 @@ For more information, see the documentation at the top of this file.
     model_short = args.model.replace('/', '_').split('-')[0]
     
     if args.just_attentions:
-        # Simpler filename for just_attentions mode
         parts = [Path(args.input_file).stem, args.mode, model_short, 'attention']
+        # Optional: include selection in filename
+        if args.attention_layers:
+            parts.append(f"L{'_'.join(map(str, args.attention_layers))}")
+        if args.attention_heads:
+            parts.append(f"H{'_'.join(map(str, args.attention_heads))}")
     else:
         parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
-        
         if args.left_context_file:
             parts.append('extra')
         if args.mode == 'ar' and args.lookahead_n > 0:
@@ -752,12 +648,11 @@ For more information, see the documentation at the top of this file.
                 parts.append(f'beam{args.beam_width}')
         if args.pll_metric == 'within_word_l2r':
             parts.append('L2R')
-    
+
     if args.left_context_file and args.just_attentions:
         parts.append('extra')
-    
-    parts.append(timestamp)
-    generated_filename = '_'.join(parts) + '.tsv'
+
+    generated_filename = '_'.join(parts + [timestamp]) + '.tsv'
     
     # Determine output path
     output_path = Path(args.output_file)
@@ -790,7 +685,9 @@ For more information, see the documentation at the top of this file.
         beam_width=args.beam_width,
         pll_metric=args.pll_metric,
         output_attentions=args.output_attentions,
-        just_attentions=args.just_attentions
+        just_attentions=args.just_attentions,
+        attention_layers=args.attention_layers,  # NEW
+        attention_heads=args.attention_heads     # NEW
     )
 
 if __name__ == "__main__":
