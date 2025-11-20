@@ -28,6 +28,8 @@ class ScoringResult:
     entropies: List[float]
     pred_columns: List[List[str]] = None
     attention_tuples: List[Tuple[int, str, int, int, int, str, float]] = None
+    layer_surprisals: Optional[List[List[float]]] = None
+    layer_entropies: Optional[List[List[float]]] = None
 
 # ============================================================================
 # Helper functions
@@ -88,6 +90,29 @@ def decode_token(tokenizer, token_id: int, is_special: bool) -> Tuple[str, str]:
         decoded_token = tokenizer.decode([token_id])
     return raw_token, decoded_token
 
+
+def logits_from_hidden_state(model, hidden_state: torch.Tensor) -> torch.Tensor:
+    """Project hidden states to logits using the model's output embeddings.
+
+    Attempts to mimic the model's final projection by applying the last-layer
+    normalization when available (e.g., GPT2's ``ln_f``).
+    """
+    if hidden_state.dim() == 3:
+        # Remove batch dimension if present
+        hidden_state = hidden_state[0]
+
+    # Apply final layer norm if the model exposes one
+    if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+        hidden_state = model.transformer.ln_f(hidden_state)
+    elif hasattr(model, "model") and hasattr(model.model, "final_layer_norm"):
+        hidden_state = model.model.final_layer_norm(hidden_state)
+
+    output_embeddings = model.get_output_embeddings()
+    if output_embeddings is None:
+        raise ValueError("Model does not expose output embeddings for per-layer surprisals")
+
+    return output_embeddings(hidden_state)
+
 def validate_sentence_inputs(
     sentence: str,
     output_attentions: bool,
@@ -141,7 +166,8 @@ def score_autoregressive(
     context_ids: List[int] = None,
     output_attentions: bool = False,
     attention_layers: Optional[List[int]] = None,
-    attention_heads: Optional[List[int]] = None
+    attention_heads: Optional[List[int]] = None,
+    surprisal_by_layer: bool = False
 ) -> ScoringResult:
     """
     Score sentence with AR model.
@@ -163,7 +189,11 @@ def score_autoregressive(
     
     # Get logits (and optionally attention) for the full sequence
     with torch.no_grad():
-        outputs = model(input_ids.unsqueeze(0), output_attentions=output_attentions)
+        outputs = model(
+            input_ids.unsqueeze(0),
+            output_attentions=output_attentions,
+            output_hidden_states=surprisal_by_layer
+        )
         logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
 
     # Extract attention if requested
@@ -184,6 +214,26 @@ def score_autoregressive(
         except (TypeError, RuntimeError) as e:
             # If stacking fails, attention not available
             pass
+
+    layer_surprisals = []
+    layer_entropies = []
+    if surprisal_by_layer and getattr(outputs, "hidden_states", None):
+        hidden_states = outputs.hidden_states[1:]  # skip embeddings
+        for layer_state in hidden_states:
+            layer_logits = logits_from_hidden_state(model, layer_state)
+            surprisals_for_layer = []
+            entropies_for_layer = []
+            for sent_pos in range(len(sentence_ids)):
+                combined_pos = sentence_start + sent_pos
+                target_id = sentence_ids[sent_pos].item()
+                if combined_pos == 0:
+                    surp = ent = float('nan')
+                else:
+                    surp, ent = compute_surprisal_entropy(layer_logits[combined_pos - 1], target_id)
+                surprisals_for_layer.append(surp)
+                entropies_for_layer.append(ent)
+            layer_surprisals.append(surprisals_for_layer)
+            layer_entropies.append(entropies_for_layer)
 
     
     # Score each token
@@ -258,7 +308,9 @@ def score_autoregressive(
         surprisals=surprisals,
         entropies=entropies,
         pred_columns=pred_columns,
-        attention_tuples=attention_tuples
+        attention_tuples=attention_tuples,
+        layer_surprisals=layer_surprisals or None,
+        layer_entropies=layer_entropies or None
     )
 
 
@@ -270,7 +322,8 @@ def score_masked_lm(
     context_ids: List[int] = None,
     output_attentions: bool = False,
     attention_layers: Optional[List[int]] = None,
-    attention_heads: Optional[List[int]] = None
+    attention_heads: Optional[List[int]] = None,
+    surprisal_by_layer: bool = False
 ) -> ScoringResult:
     """
     Score sentence with MLM using parallel masking (original PLL).
@@ -367,7 +420,8 @@ def score_masked_lm_l2r(
     context_ids: List[int] = None,
     output_attentions: bool = False,
     attention_layers: Optional[List[int]] = None,
-    attention_heads: Optional[List[int]] = None
+    attention_heads: Optional[List[int]] = None,
+    surprisal_by_layer: bool = False
 ) -> ScoringResult:
     """
     Score sentence with MLM using within_word_l2r (minicons-compatible).

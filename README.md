@@ -53,6 +53,8 @@ python src/scorer.py --input_file <file> --mode <ar|mlm> --model <model_name> [o
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
 - `--output_attentions`: Extract attention weights to separate `*_attention.tsv` file alongside main results
 - `--just_attentions`: **Fast mode** - ONLY extract attention weights (no surprisal/entropy/predictions), outputs only attention TSV
+- `--surprisal_by_layer`: Compute surprisal/entropy at every transformer layer and save a Parquet file (default suffix: `_layers.parquet`)
+- `--layer_output_file`: Custom path for the layer-level Parquet output
 
 #### AR Mode Options (GPT-style models)
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
@@ -94,6 +96,11 @@ python src/scorer.py --input_file docs.tsv --format documents --mode ar --model 
 python src/scorer.py --input_file data.tsv --mode mlm --model bert-base-uncased --output_file ./results/
 ```
 
+**Per-layer surprisal (Parquet output):**
+```bash
+python src/scorer.py --input_file data.tsv --mode ar --model gpt2 --surprisal_by_layer
+```
+
 **AR with beam search lookahead:**
 ```bash
 python src/scorer.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
@@ -131,6 +138,12 @@ The `*_attention.tsv` file contains attention weights averaged across all layers
 - Includes attention between ALL tokens when left context is provided
 - Matrix size: (N_context + N_sentence) × (N_context + N_sentence) entries per sentence
 - Use `is_context=0` to filter for sentence-only attention patterns
+
+#### Layer-wise surprisal file (when using `--surprisal_by_layer`)
+
+Layer-level surprisal and entropy values are written to a Parquet file (default suffix `_layers.parquet`) with columns:
+- `doc_id`, `sentence_id`, `layer`, `token_index`
+- `surprisal_bits`, `entropy_bits`
 - `--just_attentions` mode is significantly faster as it skips all scoring computations
 
 ## Direct Function Calls

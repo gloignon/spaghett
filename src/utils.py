@@ -277,6 +277,20 @@ def write_attention_output(output_file: str, attention_data: List[dict]):
         writer.writerows(attention_data)
 
 
+def write_layer_output_parquet(output_file: str, layer_data: List[dict]):
+    """Write per-layer surprisal/entropy data to Parquet."""
+    if not layer_data:
+        return
+
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError("pandas is required to write layer-level Parquet output") from exc
+
+    df = pd.DataFrame(layer_data)
+    df.to_parquet(output_file, index=False)
+
+
 # ============================================================================
 # Core processing function (I/O independent)
 # ============================================================================
@@ -297,8 +311,9 @@ def process_sentences(
     output_attentions: bool = False,
     just_attentions: bool = False,
     attention_layers: Optional[List[int]] = None,   # NEW
-    attention_heads: Optional[List[int]] = None     # NEW
-) -> Tuple[List[dict], List[dict]]:
+    attention_heads: Optional[List[int]] = None,    # NEW
+    surprisal_by_layer: bool = False
+) -> Tuple[List[dict], List[dict], List[dict]]:
     # Override parameters if just_attentions is True
     if just_attentions:
         output_attentions = True
@@ -318,6 +333,9 @@ def process_sentences(
         attention_heads=attention_heads       # NEW
     )
     config.validate()
+
+    if surprisal_by_layer and mode != 'ar':
+        print("Warning: surprisal_by_layer currently computes values for AR models only.", file=sys.stderr)
     
     # Auto-generate IDs if not provided
     if doc_ids is None:
@@ -352,19 +370,19 @@ def process_sentences(
             score_fn = lambda s: score_autoregressive(
                 s, left_context, tokenizer, model, top_k, lookahead_n,
                 lookahead_strategy, beam_width, context_ids, output_attentions,
-                attention_layers, attention_heads  # NEW
+                attention_layers, attention_heads, surprisal_by_layer  # NEW
             )
         elif mode == 'mlm':
             model = AutoModelForMaskedLM.from_pretrained(model_name)
             if pll_metric == 'within_word_l2r':
                 score_fn = lambda s: score_masked_lm_l2r(
                     s, tokenizer, model, top_k, context_ids, output_attentions,
-                    attention_layers, attention_heads  # NEW
+                    attention_layers, attention_heads, surprisal_by_layer  # NEW
                 )
             else:
                 score_fn = lambda s: score_masked_lm(
                     s, tokenizer, model, top_k, context_ids, output_attentions,
-                    attention_layers, attention_heads  # NEW
+                    attention_layers, attention_heads, surprisal_by_layer  # NEW
                 )
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
@@ -383,13 +401,21 @@ def process_sentences(
     # Process sentences
     results = []
     attention_results = []
+    layer_results = []
     iterator = zip(doc_ids, sentence_ids, sentences)
     if progress:
         desc = "Extracting attention" if just_attentions else "Processing"
         iterator = tqdm(iterator, total=len(sentences), desc=desc)
     
     for doc_id, sent_id, sentence in iterator:
-        raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols, attn_tuples = score_fn(sentence)
+        score_result = score_fn(sentence)
+        raw_tokens = score_result.raw_tokens
+        tokens = score_result.scored_tokens
+        is_special_flags = score_result.is_special_flags
+        surprisals = score_result.surprisals
+        entropies = score_result.entropies
+        pred_cols = score_result.pred_columns or [[] for _ in tokens]
+        attn_tuples = score_result.attention_tuples
         
         # Only populate results if not just_attentions
         if not just_attentions:
@@ -433,8 +459,23 @@ def process_sentences(
                     'rx_token': rx_token,
                     'attn_score': f'{weight:.6f}'
                 })
-    
-    return results, attention_results
+
+        if surprisal_by_layer and score_result.layer_surprisals is not None:
+            layer_entropies = score_result.layer_entropies or [[] for _ in score_result.layer_surprisals]
+            for layer_idx, layer_surp in enumerate(score_result.layer_surprisals):
+                entropies_for_layer = layer_entropies[layer_idx] if layer_idx < len(layer_entropies) else []
+                for idx, surp in enumerate(layer_surp, 1):
+                    ent = entropies_for_layer[idx - 1] if idx - 1 < len(entropies_for_layer) else float('nan')
+                    layer_results.append({
+                        'doc_id': doc_id,
+                        'sentence_id': sent_id,
+                        'layer': layer_idx,
+                        'token_index': idx,
+                        'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
+                        'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
+                    })
+
+    return results, attention_results, layer_results
 
 
 # ============================================================================
@@ -456,7 +497,9 @@ def process_from_file(
     output_attentions: bool = False,
     just_attentions: bool = False,
     attention_layers: Optional[List[int]] = None,  # NEW
-    attention_heads: Optional[List[int]] = None    # NEW
+    attention_heads: Optional[List[int]] = None,   # NEW
+    surprisal_by_layer: bool = False,
+    layer_output_file: Optional[str] = None
 ):
     """
     Process input TSV file and write output TSV file.
@@ -488,7 +531,7 @@ def process_from_file(
         sentences = [item[2] for item in data]
         
         # Process using core function
-        results, attention_results = process_sentences(
+        results, attention_results, layer_results = process_sentences(
             sentences=sentences,
             mode=mode,
             model_name=model_name,
@@ -504,14 +547,15 @@ def process_from_file(
             output_attentions=output_attentions,
             just_attentions=just_attentions,
             attention_layers=attention_layers,    # NEW
-            attention_heads=attention_heads       # NEW
+            attention_heads=attention_heads,      # NEW
+            surprisal_by_layer=surprisal_by_layer
         )
         
         # Write output only if not just_attentions
         if not just_attentions:
             write_output(output_file, results, top_k, lookahead_n, mode)
             print(f"Results written to: {output_file}")
-        
+
         # Write attention output if requested or if just_attentions
         if (output_attentions or just_attentions) and attention_results:
             # Create attention filename
@@ -522,9 +566,23 @@ def process_from_file(
                 # For normal mode with attentions, append _attention to filename
                 base_path = Path(output_file)
                 attn_file = base_path.parent / (base_path.stem + '_attention' + base_path.suffix)
-            
+
             write_attention_output(str(attn_file), attention_results)
             print(f"Attention scores written to: {attn_file}")
+
+        if surprisal_by_layer and layer_results:
+            if layer_output_file:
+                layer_path = Path(layer_output_file)
+                if layer_path.is_dir() or layer_path.suffix == '':
+                    base_name = Path(output_file).stem + '_layers.parquet'
+                    layer_path = layer_path / base_name if layer_path.is_dir() else layer_path.with_name(base_name)
+            else:
+                base_path = Path(output_file)
+                layer_path = base_path.with_name(base_path.stem + '_layers.parquet')
+
+            layer_path.parent.mkdir(parents=True, exist_ok=True)
+            write_layer_output_parquet(str(layer_path), layer_results)
+            print(f"Layer surprisal scores written to: {layer_path}")
         
     except FileNotFoundError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
@@ -604,6 +662,10 @@ For more information, see the documentation at the top of this file.
                         help='Specific layer indices to extract attention from (0-indexed). Default: last layer only')
     parser.add_argument('--attention_heads', type=int, nargs='+', default=None,
                         help='Specific attention head indices to extract (0-indexed). Default: all heads (averaged)')
+    parser.add_argument('--surprisal_by_layer', action='store_true',
+                        help='Compute surprisal/entropy at every transformer layer and write Parquet output')
+    parser.add_argument('--layer_output_file', default=None,
+                        help='Optional Parquet filename for layer-level surprisal output. Default: <output>_layers.parquet')
 
     # Check if no arguments provided
     if len(sys.argv) == 1:
@@ -674,7 +736,9 @@ For more information, see the documentation at the top of this file.
         output_attentions=args.output_attentions,
         just_attentions=args.just_attentions,
         attention_layers=args.attention_layers,  # NEW
-        attention_heads=args.attention_heads     # NEW
+        attention_heads=args.attention_heads,    # NEW
+        surprisal_by_layer=args.surprisal_by_layer,
+        layer_output_file=args.layer_output_file
     )
 
 if __name__ == "__main__":
