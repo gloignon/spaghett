@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 import pytest
+import math
 
 
 # Add src to path
@@ -10,7 +11,6 @@ sys.path.insert(0, str(src_path))
 from scorer import score_autoregressive, score_masked_lm, score_masked_lm_l2r
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 
-import torch
 
 @pytest.fixture
 def ar_model():
@@ -18,8 +18,7 @@ def ar_model():
     model_name = "gpt2"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        output_attentions=True
+        model_name
     )
     return tokenizer, model
 
@@ -30,8 +29,7 @@ def mlm_model():
     model_name = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForMaskedLM.from_pretrained(
-        model_name,
-        output_attentions=True
+        model_name
     )
     return tokenizer, model
 
@@ -47,8 +45,7 @@ def test_score_autoregressive_basic(ar_model):
         tokenizer=tokenizer,
         model=model,
         top_k=3,
-        lookahead_n=0,
-        output_attentions=False
+        lookahead_n=0
     )
     
     assert len(result.scored_tokens) > 0
@@ -69,8 +66,7 @@ def test_score_autoregressive_with_lookahead(ar_model):
         model=model,
         top_k=3,
         lookahead_n=2,
-        lookahead_strategy='greedy',
-        output_attentions=False
+        lookahead_strategy='greedy'
     )
     
     assert len(result.scored_tokens) > 0
@@ -89,8 +85,7 @@ def test_score_masked_lm(mlm_model):
         sentence=sentence,
         tokenizer=tokenizer,
         model=model,
-        top_k=3,
-        output_attentions=False
+        top_k=3
     )
     
     assert len(result.scored_tokens) > 0
@@ -108,8 +103,7 @@ def test_score_masked_lm_l2r(mlm_model):
         sentence=sentence,
         tokenizer=tokenizer,
         model=model,
-        top_k=3,
-        output_attentions=False
+        top_k=3
     )
     
     assert len(result.scored_tokens) > 0
@@ -125,8 +119,7 @@ def test_empty_sentence_ar(ar_model):
         sentence="",
         left_context="",
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     assert len(result.scored_tokens) == 0
@@ -140,33 +133,11 @@ def test_empty_sentence_mlm(mlm_model):
     result = score_masked_lm(
         sentence="",
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     assert len(result.scored_tokens) == 0
     assert len(result.surprisals) == 0
-
-
-def test_attention_extraction_ar(ar_model):
-    """Test that attention extraction works."""
-    tokenizer, model = ar_model
-    sentence = "Hello world"
-    
-    result = score_autoregressive(
-        sentence=sentence,
-        left_context="",
-        tokenizer=tokenizer,
-        model=model,
-        output_attentions=True
-    )
-    
-    assert result.attention_tuples is not None
-    # Should have some attention tuples
-    assert len(result.attention_tuples) > 0
-
-
-import math  # Add this import at the top
 
 
 if __name__ == "__main__":
