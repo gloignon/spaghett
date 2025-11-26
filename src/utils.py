@@ -175,12 +175,20 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
     return data
 
 def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str, top_k_cf_surprisal: bool = False, output_format: str = 'tsv'):
-    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special',
-               'surprisal_bits', 'entropy_bits']
+    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special']
+    # Add surprisal/entropy columns if present
+    sample = results[0] if results else {}
+    if 'surprisal_bits' in sample and 'entropy_bits' in sample:
+        columns += ['surprisal_bits', 'entropy_bits']
+    # Add layered columns if present
+    layered_cols = [c for c in sample.keys() if c.startswith('layer')]
+    columns += sorted(layered_cols)
     columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
     if mode == 'ar':
         columns += [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
     df = pd.DataFrame(results)
+    # Only select columns that exist in the DataFrame
+    columns = [c for c in columns if c in df.columns]
     df = df[columns]
     if top_k_cf_surprisal:
         for i in range(1, top_k + 1):
@@ -207,7 +215,8 @@ def process_sentences(
     doc_ids: List[str] = None,
     sentence_ids: List[str] = None,
     progress: bool = True,
-    pll_metric: str = 'original'
+    pll_metric: str = 'original',
+    layers: Optional[List[int]] = None
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -237,14 +246,26 @@ def process_sentences(
     context_ids = tokenizer(left_context, add_special_tokens=False)["input_ids"] if left_context else []
     try:
         if mode == 'ar':
+            from scorer import score_autoregressive_by_layers, score_autoregressive
             model = AutoModelForCausalLM.from_pretrained(model_name)
-            score_fn = lambda s: score_autoregressive(
-                s, left_context, tokenizer, model, top_k, lookahead_n,
-                lookahead_strategy, beam_width, context_ids
-            )
+            if layers is not None:
+                score_fn = lambda s: score_autoregressive_by_layers(
+                    s, left_context, tokenizer, model, layers, top_k, lookahead_n,
+                    lookahead_strategy, beam_width, context_ids
+                )
+            else:
+                score_fn = lambda s: score_autoregressive(
+                    s, left_context, tokenizer, model, top_k, lookahead_n,
+                    lookahead_strategy, beam_width, context_ids
+                )
         elif mode == 'mlm':
+            from scorer import score_masked_lm_by_layers, score_masked_lm, score_masked_lm_l2r
             model = AutoModelForMaskedLM.from_pretrained(model_name)
-            if pll_metric == 'within_word_l2r':
+            if layers is not None:
+                score_fn = lambda s: score_masked_lm_by_layers(
+                    s, tokenizer, model, layers, top_k, context_ids
+                )
+            elif pll_metric == 'within_word_l2r':
                 score_fn = lambda s: score_masked_lm_l2r(
                     s, tokenizer, model, top_k, context_ids
                 )
@@ -271,32 +292,58 @@ def process_sentences(
         iterator = tqdm(iterator, total=len(sentences), desc=desc)
     for doc_id, sent_id, sentence in iterator:
         result = score_fn(sentence)
-        raw_tokens = result.raw_tokens
-        tokens = result.scored_tokens
-        is_special_flags = result.is_special_flags
-        surprisals = result.surprisals
-        entropies = result.entropies
-        pred_cols = result.pred_columns
-        for idx, (raw_token, token, is_special, surp, ent, preds) in enumerate(
-            zip(raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols), 1
-        ):
-            row = {
-                'doc_id': doc_id,
-                'sentence_id': sent_id,
-                'token_index': idx,
-                'token': raw_token,
-                'token_decoded': token,
-                'is_special': is_special,
-                'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
-                'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
-            }
-            for i in range(1, top_k + 1):
-                row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
-            if mode == 'ar':
-                offset = top_k
-                for i in range(1, lookahead_n + 1):
-                    row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
-            results.append(row)
+        if layers is not None and isinstance(result, dict):
+            # Multiple layers: result is {layer_idx: ScoringResult}
+            num_tokens = len(next(iter(result.values())).scored_tokens)
+            for idx in range(num_tokens):
+                row = {
+                    'doc_id': doc_id,
+                    'sentence_id': sent_id,
+                    'token_index': idx + 1,
+                    'token': next(iter(result.values())).raw_tokens[idx],
+                    'token_decoded': next(iter(result.values())).scored_tokens[idx],
+                    'is_special': next(iter(result.values())).is_special_flags[idx]
+                }
+                for layer_idx, layer_result in result.items():
+                    row[f'layer{layer_idx}_surprisal_bits'] = '' if math.isnan(layer_result.surprisals[idx]) else f'{layer_result.surprisals[idx]:.4f}'
+                    row[f'layer{layer_idx}_entropy_bits'] = '' if math.isnan(layer_result.entropies[idx]) else f'{layer_result.entropies[idx]:.4f}'
+                # Use top_k preds from last layer only
+                last_layer = max(result.keys())
+                preds = result[last_layer].pred_columns[idx]
+                for i in range(1, top_k + 1):
+                    row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
+                if mode == 'ar':
+                    offset = top_k
+                    for i in range(1, lookahead_n + 1):
+                        row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+                results.append(row)
+        else:
+            raw_tokens = result.raw_tokens
+            tokens = result.scored_tokens
+            is_special_flags = result.is_special_flags
+            surprisals = result.surprisals
+            entropies = result.entropies
+            pred_cols = result.pred_columns
+            for idx, (raw_token, token, is_special, surp, ent, preds) in enumerate(
+                zip(raw_tokens, tokens, is_special_flags, surprisals, entropies, pred_cols), 1
+            ):
+                row = {
+                    'doc_id': doc_id,
+                    'sentence_id': sent_id,
+                    'token_index': idx,
+                    'token': raw_token,
+                    'token_decoded': token,
+                    'is_special': is_special,
+                    'surprisal_bits': '' if math.isnan(surp) else f'{surp:.4f}',
+                    'entropy_bits': '' if math.isnan(ent) else f'{ent:.4f}'
+                }
+                for i in range(1, top_k + 1):
+                    row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
+                if mode == 'ar':
+                    offset = top_k
+                    for i in range(1, lookahead_n + 1):
+                        row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+                results.append(row)
     return results
 
 # ============================================================================
@@ -312,7 +359,8 @@ def process_from_file(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    pll_metric: str = 'original'
+    pll_metric: str = 'original',
+    layers: Optional[list] = None
 ):
     """
     Process input TSV file and write output TSV file.
@@ -348,7 +396,8 @@ def process_from_file(
             doc_ids=doc_ids,
             sentence_ids=sentence_ids,
             progress=True,
-            pll_metric=pll_metric
+            pll_metric=pll_metric,
+            layers=layers
         )
         write_output(output_file, results, top_k, lookahead_n, mode)
         print(f"Results written to: {output_file}")

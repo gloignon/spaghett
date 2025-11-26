@@ -8,7 +8,7 @@ cd /d "%~dp0"
 if not exist "out" mkdir "out"
 
 echo ===== Run 1: AR without left context (beam)=====
-python -u "src\scorer.py" ^
+python -u "src\cli.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --lookahead_strategy "beam" ^
   --lookahead_n 3 ^
@@ -24,7 +24,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo.
 echo ===== Run 2: AR with left context (beam) =====
-python -u "src\scorer.py" ^
+python -u "src\cli.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --left_context_file "in\demo_context.txt" ^
   --lookahead_strategy "beam" ^
@@ -36,7 +36,7 @@ python -u "src\scorer.py" ^
 
 echo.
 echo ===== Run 3: Masked token =====
-python -u "src\scorer.py" ^
+python -u "src\cli.py" ^
   --input_file "in\demo_sentences.tsv" ^
   --left_context_file "in\demo_context.txt" ^
   --top_k 3 ^

@@ -38,6 +38,8 @@ Examples:
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    parser.add_argument('--layers', nargs='*', default=None,
+        help='Optional: list of layer indices to compute surprisal from, e.g. [0,5,7] or all for all layers. Default: last layer only.')
     parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
         help='Output format: tsv (default) or parquet')
 
@@ -48,6 +50,28 @@ Examples:
         sys.exit(1)
 
     args = parser.parse_args()
+
+    layers = args.layers
+    if layers is not None:
+        if len(layers) == 1 and layers[0].lower() == "all":
+            # Load model and get number of layers
+            if args.mode == "ar":
+                from transformers import AutoModelForCausalLM
+                model = AutoModelForCausalLM.from_pretrained(args.model)
+                num_layers = len(model.transformer.h)
+                # hidden_states includes embeddings at index 0, then one entry per block
+                layers = list(range(num_layers + 1))
+            elif args.mode == "mlm":
+                from transformers import AutoModelForMaskedLM
+                model = AutoModelForMaskedLM.from_pretrained(args.model)
+                num_layers = model.config.num_hidden_layers
+                # hidden_states includes embeddings at index 0, then one entry per block
+                layers = list(range(num_layers + 1))
+            else:
+                layers = None
+        else:
+            # Convert to int if not already
+            layers = [int(l) for l in layers]
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
@@ -84,7 +108,8 @@ Examples:
         lookahead_n=args.lookahead_n,
         lookahead_strategy=args.lookahead_strategy,
         beam_width=args.beam_width,
-        pll_metric=args.pll_metric
+        pll_metric=args.pll_metric,
+        layers=layers
     )
 
 if __name__ == "__main__":

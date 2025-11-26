@@ -3,7 +3,7 @@ scorer.py
 Scoring functions for autoregressive and masked language models.
 Includes surprisal, entropy, top-k predictions, lookahead generation.
 
-CLI stuff is in utils.py
+CLI stuff is in cli.py
 attention stuff is no longer in this project!
 '''
 import math
@@ -230,7 +230,7 @@ def score_autoregressive(
         pred_columns=pred_columns
     )
 
-
+# This is the original PLL scoring function
 def score_masked_lm(
     sentence: str,
     tokenizer,
@@ -302,7 +302,7 @@ def score_masked_lm(
         pred_columns=pred_columns
     )
 
-
+# This is the within-word left-to-right PLL scoring function
 def score_masked_lm_l2r(
     sentence: str,
     tokenizer,
@@ -469,3 +469,220 @@ def beam_search_lookahead(model, tokenizer, prefix_ids: torch.Tensor, n: int, be
     best_beam = beams[0]
     return best_beam[2]
 
+# ============================================================================
+# Layer-batched surprisal scoring functions
+# ============================================================================
+
+def score_autoregressive_by_layers(
+    sentence: str,
+    left_context: str,
+    tokenizer,
+    model,
+    layers: Optional[List[int]] = None,
+    top_k: int = 5,
+    lookahead_n: int = 3,
+    lookahead_strategy: str = 'greedy',
+    beam_width: int = 3,
+    context_ids: List[int] = None
+) -> dict:
+    """
+    Compute surprisal for specified layers in AR model.
+    Returns a dict: {layer_idx: ScoringResult}
+    """
+    empty_result = validate_sentence_inputs(sentence)
+    if empty_result is not None:
+        return {}
+
+    _, sentence_ids = tokenize_sentence(sentence, tokenizer)
+    empty_ids_result = validate_sentence_inputs(sentence, sentence_ids)
+    if empty_ids_result is not None:
+        return {}
+
+    input_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
+    special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
+
+    with torch.no_grad():
+        outputs = model(input_ids.unsqueeze(0), output_hidden_states=True)
+        # logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
+        hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
+
+    # If no layers specified, use last layer only
+    if layers is None:
+        layers = [len(hidden_states) - 1]
+
+    results = {}
+    for layer_idx in layers:
+        # For AR, we need to project hidden states to logits for each layer
+        # Use model.lm_head (for GPT2, etc.)
+        layer_hidden = hidden_states[layer_idx][0]  # shape: (seq_len, hidden_dim)
+        layer_logits = model.lm_head(layer_hidden)  # shape: (seq_len, vocab_size)
+
+        raw_tokens = []
+        scored_tokens = []
+        is_special_flags = []
+        surprisals = []
+        entropies = []
+        pred_columns = []
+
+        for sent_pos in range(len(sentence_ids)):
+            combined_pos = sentence_start + sent_pos
+            target_id = sentence_ids[sent_pos].item()
+            is_special = 1 if special_mask[sent_pos] else 0
+            raw_token, token_str = decode_token(tokenizer, target_id, is_special)
+
+            if combined_pos == 0:
+                # Use minimal input for first token
+                with torch.no_grad():
+                    if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
+                        minimal_input = torch.tensor([[tokenizer.bos_token_id]])
+                        minimal_outputs = model(minimal_input, output_hidden_states=True)
+                        minimal_hidden = minimal_outputs.hidden_states[layer_idx][0, -1]
+                        minimal_logits = model.lm_head(minimal_hidden)
+                    else:
+                        minimal_logits = layer_logits[0] if len(layer_logits) > 0 else None
+
+                if minimal_logits is not None:
+                    surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
+                    top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k)
+                    lookahead = []
+                    if lookahead_n > 0:
+                        lookahead = []  # Not supported for non-final layers
+                    pred_col = top_k_preds + lookahead
+                else:
+                    surprisal = entropy = float('nan')
+                    pred_col = [''] * (1 + top_k + lookahead_n)
+            else:
+                surprisal, entropy = compute_surprisal_entropy(layer_logits[combined_pos - 1], target_id)
+                top_k_preds = get_top_k_predictions(layer_logits[combined_pos - 1], tokenizer, top_k)
+                lookahead = []
+                if lookahead_n > 0:
+                    lookahead = []  # Not supported for non-final layers
+                pred_col = top_k_preds + lookahead
+
+            raw_tokens.append(raw_token)
+            scored_tokens.append(token_str)
+            is_special_flags.append(is_special)
+            surprisals.append(surprisal)
+            entropies.append(entropy)
+            pred_columns.append(pred_col)
+
+        results[layer_idx] = ScoringResult(
+            raw_tokens=raw_tokens,
+            scored_tokens=scored_tokens,
+            is_special_flags=is_special_flags,
+            surprisals=surprisals,
+            entropies=entropies,
+            pred_columns=pred_columns
+        )
+    return results
+
+def score_masked_lm_by_layers(
+    sentence: str,
+    tokenizer,
+    model,
+    layers: Optional[List[int]] = None,
+    top_k: int = 5,
+    context_ids: List[int] = None
+) -> dict:
+    """
+    Compute surprisal for specified layers in MLM model.
+    Returns a dict: {layer_idx: ScoringResult}
+    """
+    if tokenizer.mask_token_id is None:
+        raise ValueError("Model doesn't have a [MASK] token. Use --mode ar instead.")
+
+    empty_result = validate_sentence_inputs(sentence)
+    if empty_result is not None:
+        return {}
+
+    encoding, sentence_ids = tokenize_sentence(sentence, tokenizer)
+    empty_ids_result = validate_sentence_inputs(sentence, sentence_ids)
+    if empty_ids_result is not None:
+        return {}
+
+    base_ids, sentence_start = prepare_input_with_context(sentence_ids, context_ids)
+    special_mask = tokenizer.get_special_tokens_mask(sentence_ids.tolist(), already_has_special_tokens=True)
+    num_tokens = len(sentence_ids)
+
+    masked_batch = []
+    for sent_pos in range(num_tokens):
+        combined_pos = sentence_start + sent_pos
+        masked_ids = base_ids.clone()
+        masked_ids[combined_pos] = tokenizer.mask_token_id
+        masked_batch.append(masked_ids)
+
+    masked_batch = torch.stack(masked_batch)
+
+    with torch.no_grad():
+        outputs = model(masked_batch, output_hidden_states=True)
+        # all_logits = outputs.logits
+        hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
+
+    # If no layers specified, use last layer only
+    if layers is None:
+        layers = [len(hidden_states) - 1]
+
+    results = {}
+    for layer_idx in layers:
+        # For MLM, project hidden states to logits for each layer
+        # Use model.cls (for BERT) or model.lm_head (for Camembert, etc.)
+        layer_hidden = hidden_states[layer_idx]  # shape: (batch, seq_len, hidden_dim)
+        if hasattr(model, "cls"):
+            layer_logits = model.cls(layer_hidden)
+        elif hasattr(model, "lm_head"):
+            layer_logits = model.lm_head(layer_hidden)
+        else:
+            # Try model.get_output_embeddings() (common HF API)
+            out_emb = None
+            try:
+                out_emb = model.get_output_embeddings()
+            except Exception:
+                out_emb = None
+
+            if out_emb is not None:
+                # If it's a Linear layer (hidden_dim -> vocab_size)
+                if isinstance(out_emb, torch.nn.Linear):
+                    layer_logits = out_emb(layer_hidden)
+                else:
+                    # If embeddings (vocab_size x emb_dim), do matmul
+                    try:
+                        emb_weight = out_emb.weight
+                        layer_logits = torch.matmul(layer_hidden, emb_weight.t())
+                    except Exception:
+                        raise AttributeError("Unable to project hidden states via output embeddings")
+            else:
+                # Last resort: try input embeddings weight
+                try:
+                    in_emb = model.get_input_embeddings()
+                    emb_weight = in_emb.weight
+                    layer_logits = torch.matmul(layer_hidden, emb_weight.t())
+                except Exception:
+                    raise AttributeError("Model does not have a suitable output head (cls, lm_head) or usable embeddings")
+
+        raw_tokens, scored_tokens, is_special_flags = [], [], []
+        surprisals, entropies, pred_columns = [], [], []
+
+        for sent_pos in range(num_tokens):
+            combined_pos = sentence_start + sent_pos
+            target_id = sentence_ids[sent_pos].item()
+            is_special = 1 if special_mask[sent_pos] else 0
+            logits = layer_logits[sent_pos, combined_pos]
+            surprisal, entropy = compute_surprisal_entropy(logits, target_id)
+            top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
+            raw_token, token_str = decode_token(tokenizer, target_id, is_special)
+            raw_tokens.append(raw_token)
+            scored_tokens.append(token_str)
+            is_special_flags.append(is_special)
+            surprisals.append(surprisal)
+            entropies.append(entropy)
+            pred_columns.append(top_k_preds)
+
+        results[layer_idx] = ScoringResult(
+            raw_tokens=raw_tokens,
+            scored_tokens=scored_tokens,
+            is_special_flags=is_special_flags,
+            surprisals=surprisals,
+            entropies=entropies,
+            pred_columns=pred_columns
+        )
+    return results
