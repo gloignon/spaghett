@@ -12,7 +12,7 @@ You can also send the repo link to colleages and friends interested in computati
 * Minimalism over performance: simple loops used in place of batching, no CUDA, nothing fancy
 * Handles accented characters
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
-* Simple Command Line Interface, no need to modify the code (but scoring functions can easily be loaded from your own code).
+* Simple Command Line Interface, and scoring functions can easily be loaded from your own code.
 
 ## Installation
 * You will need python, install if you don't have it already.
@@ -37,6 +37,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 - `--mode`: Model type - `ar` (autoregressive/GPT-style) or `mlm` (masked/BERT-style)
 - `--model`: HuggingFace model name (e.g., `gpt2`, `bert-base-uncased`, `almanach/camembert-base`)
 
+
 #### Optional Arguments
 - `--output_file`: Output path (default: auto-generated with timestamp)
   - Can be a specific filename: `results.tsv`
@@ -46,7 +47,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
 - `--top_k_cf_surprisal`: If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)
-- `--left_context_file`: Path to text file for left context (prepended to each sentence)
+- `--layers`: List of layer indices to compute surprisal from (e.g. `--layers 0 5 11`). Option `--layers all` is also possible. If not specified, only the last layer is used.
 
 #### AR Mode Options (GPT-style models)
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
@@ -78,12 +79,19 @@ python src/cli.py --input_file docs.tsv --format documents --mode ar --model gpt
 python src/cli.py --input_file data.tsv --mode mlm --model bert-base-uncased --output_file ./results/
 ```
 
+
+**Surprisal by specific layers:**
+```bash
+python src/cli.py --input_file data.tsv --mode ar --model gpt2 --layers 0 5 11
+```
+
 **AR with beam search lookahead:**
 ```bash
 python src/cli.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
 ```
 
 ### Output Format
+
 
 #### Main Results File
 
@@ -92,8 +100,8 @@ The output TSV contains:
 - `token`: Raw token (with special characters like `▁`, `Ġ`)
 - `token_decoded`: Human-readable token
 - `is_special`: Flag for special tokens (BOS, EOS, CLS, SEP, etc.)
-- `surprisal_bits`: -log₂(p(token|context))
-- `entropy_bits`: Shannon entropy of the prediction distribution
+- `surprisal_bits`, `entropy_bits`: Surprisal and entropy from the last layer (default)
+- `layer{idx}_surprisal_bits`, `layer{idx}_entropy_bits`: Surprisal and entropy for each requested layer (if `--layers` is used)
 - `pred_alt_1` to `pred_alt_N`: Top-k alternative predictions (N = `--top_k`)
 - `pred_next_1` to `pred_next_M`: Lookahead predictions (M = `--lookahead_n`, AR mode only)
 

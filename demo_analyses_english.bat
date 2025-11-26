@@ -8,7 +8,7 @@ cd /d "%~dp0"
 if not exist "out" mkdir "out"
 
 echo ===== English demo=====
-python -u "src\utils.py" ^
+python -u "src\cli.py" ^
   --input_file "in\demo_sentences_english.tsv" ^
   --lookahead_n 0 ^
   --top_k 1 ^
