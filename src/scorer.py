@@ -57,7 +57,7 @@ def compute_surprisal_entropy(logits: torch.Tensor, target_id: int) -> Tuple[flo
     return surprisal, entropy
 
 
-def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
+def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[tuple]:
     """
     Get the top-k most probable tokens.
     Returns raw tokens with special characters preserved.
@@ -129,14 +129,14 @@ def tokenize_sentence(sentence: str, tokenizer):
 # ============================================================================
 def score_autoregressive(
     sentence: str,
-    left_context: str,
     tokenizer,
     model,
     top_k: int = 5,
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    **kwargs
 ) -> ScoringResult:
     """
     Score sentence with AR model.
@@ -236,7 +236,8 @@ def score_masked_lm(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    **kwargs
 ) -> ScoringResult:
     """
     Score sentence with MLM using parallel masking (original PLL).
@@ -308,7 +309,8 @@ def score_masked_lm_l2r(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    **kwargs
 ) -> ScoringResult:
     """
     Score sentence with MLM using within_word_l2r (minicons-compatible).

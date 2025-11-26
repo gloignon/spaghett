@@ -20,14 +20,15 @@ Examples:
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--input_file', required=True, help='Input TSV file')
-    parser.add_argument('--output_file', default='simple_output.tsv', help='Output TSV file or folder (default: auto-generated filename in current directory)')
+    parser.add_argument('--input_file', required=True, type=Path, help='Input TSV file')
+    parser.add_argument('--output_file', default=Path('simple_output.tsv'), type=Path,
+                        help='Output TSV file or folder (default: auto-generated filename in current directory)')
     parser.add_argument('--mode', choices=['ar', 'mlm'], required=True,
                        help='Model mode: "ar" for autoregressive (GPT), "mlm" for masked LM (BERT)')
     parser.add_argument('--model', required=True,
                        help='HuggingFace model name (e.g., "gpt2", "bert-base-uncased")')
-    parser.add_argument('--format', choices=['documents', 'sentences'], default="sentences",
-                       help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
+    parser.add_argument('--format', dest='format_type', choices=['documents', 'sentences'], default="sentences",
+                        help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
     parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
     parser.add_argument('--top_k_cf_surprisal', action='store_true',
@@ -39,7 +40,7 @@ Examples:
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
     parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
-        help='Output format: tsv (default) or parquet')
+                        help='Output format: tsv (default) or parquet')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -51,7 +52,7 @@ Examples:
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
-    parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
+    parts = [args.input_file.stem, args.mode, model_short, f'k{args.top_k}']
     if args.left_context_file:
         parts.append('extra')
     if args.mode == 'ar' and args.lookahead_n > 0:
@@ -60,31 +61,35 @@ Examples:
             parts.append(f'beam{args.beam_width}')
     if args.pll_metric == 'within_word_l2r':
         parts.append('L2R')
-    generated_filename = '_'.join(parts + [timestamp]) + '.tsv'
-    output_path = Path(args.output_file)
-    if output_path.is_dir() or (not output_path.exists() and output_path.suffix == ''):
+    ext = '.parquet' if args.output_format == 'parquet' else '.tsv'
+    generated_filename = '_'.join(parts + [timestamp]) + ext
+    output_path = args.output_file
+    # If output path is a directory (existing or implied by no suffix), treat as folder
+    if (output_path.exists() and output_path.is_dir()) or (not output_path.exists() and output_path.suffix == ''):
         output_path.mkdir(parents=True, exist_ok=True)
         final_output = output_path / generated_filename
-        print(f"→ Output: {final_output}")
-    elif args.output_file == 'simple_output.tsv':
+        print(f"Output: {final_output}")
+    elif output_path == Path('simple_output.tsv'):
         final_output = Path(generated_filename)
-        print(f"→ Output: {final_output}")
+        print(f"Output: {final_output}")
     else:
         final_output = output_path
         final_output.parent.mkdir(parents=True, exist_ok=True)
-        print(f"→ Output: {final_output}")
+        print(f"Output: {final_output}")
     process_from_file(
-        input_file=args.input_file,
+        input_file=str(args.input_file),
         output_file=str(final_output),
         mode=args.mode,
         model_name=args.model,
-        format_type=args.format,
+        format_type=args.format_type,
         left_context_file=args.left_context_file,
         top_k=args.top_k,
         lookahead_n=args.lookahead_n,
         lookahead_strategy=args.lookahead_strategy,
         beam_width=args.beam_width,
-        pll_metric=args.pll_metric
+        pll_metric=args.pll_metric,
+        top_k_cf_surprisal=args.top_k_cf_surprisal,
+        output_format=args.output_format
     )
 
 if __name__ == "__main__":

@@ -56,8 +56,7 @@ def test_ar_surprisal_correlation_with_minicons(gpt2_models):
         sentence=sentence,
         left_context="",
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Minicons
@@ -110,8 +109,7 @@ def test_mlm_surprisal_correlation_with_minicons(bert_models):
     result = score_masked_lm(
         sentence=sentence,
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Minicons
@@ -182,16 +180,14 @@ def test_mlm_l2r_differs_from_parallel(bert_models):
     l2r_result = score_masked_lm_l2r(
         sentence=sentence,
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Parallel masking
     parallel_result = score_masked_lm(
         sentence=sentence,
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Compare results
@@ -255,8 +251,7 @@ def test_token_count_matches_ar(gpt2_models):
         sentence=sentence,
         left_context="",
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Minicons
@@ -282,8 +277,7 @@ def test_token_count_matches_mlm(bert_models):
     result = score_masked_lm(
         sentence=sentence,
         tokenizer=tokenizer,
-        model=model,
-        output_attentions=False
+        model=model
     )
     
     # Filter out special tokens
@@ -315,8 +309,7 @@ def test_our_implementation_produces_valid_scores(gpt2_models):
             sentence=sent,
             left_context="",
             tokenizer=tokenizer,
-            model=model,
-            output_attentions=False
+            model=model
         )
         
         # All scores should be non-negative
