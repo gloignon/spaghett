@@ -5,12 +5,12 @@ You can also send the repo link to colleages and friends interested in computati
 
 ## Features
 * Works with AR and masked-token models from Hugging Face
-* PLL or L2R scoring available when using a masked-token model. Results identical to minicons (tested in multiple situations: see test/test_minicons_compare.py).
+* PLL or L2R scoring available when using a masked-token model (Kauf & Ivanova, 2023). Results identical to minicons (Misra, 2022), tested in multiple situations: see test/test_minicons_compare.py).
 * Extracts surprisal, entropy and the next predicted word with the highest probability (i.e. what the LLM computed would be the continuation)
-* Can output surprisal features per LLM layer.
+* Can output surprisal features per LLM layer (see Kuribayashi et al., 2025; Li et al., 2021).
 * Extra left context: you can provide a common context file for semantic continuity, it will be prepended to each sentence's context window.
 * Can predict the n most probably next words, choice of greedy algorithm or beam search (will assemble next subtokens to reconstitute the word).
-* Handles accented characters. Languages tested: English, French.
+* Handles accented characters.
 * Simple Command Line Interface, and scoring functions can easily be loaded from your own code.
 
 # Similar work
@@ -153,3 +153,10 @@ python test/test_layered_surprisal.py
 * Add different context window modes (previous sentence, previous n words, full context, etc.)
 * Performance-optimized version with batching and GPU acceleration
 * Support for additional model architectures
+
+## Bibliography
+
+* Kauf, C., & Ivanova, A. (2023). A better way to do masked language model scoring. arXiv preprint arXiv:2305.10588.
+* Kuribayashi, T., Oseki, Y., Taieb, S. B., Inui, K., & Baldwin, T. (2025). Large language models are human-like internally. arXiv preprint arXiv:2502.01615.
+* Li, B., Zhu, Z., Thomas, G., Xu, Y., & Rudzicz, F. (2021). How is BERT surprised? Layerwise detection of linguistic anomalies. arXiv preprint arXiv:2105.07452.
+* Misra, K. (2022). minicons: Enabling flexible behavioral and representational analyses of transformer language models. arXiv preprint arXiv:2203.13112.
