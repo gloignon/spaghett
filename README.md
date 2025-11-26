@@ -5,17 +5,23 @@ You can also send the repo link to colleages and friends interested in computati
 
 ## Features
 * Works with AR and masked-token models from Hugging Face
-* L2R scoring is available when using a masked-token model. Results should be identical to minicons (tested in multiple situations: see test/test_minicons_compare.py).
+* PLL or L2R scoring available when using a masked-token model. Results identical to minicons (tested in multiple situations: see test/test_minicons_compare.py).
 * Extracts surprisal, entropy and the next predicted word with the highest probability (i.e. what the LLM computed would be the continuation)
-* Works sentence by sentence only (for now), but you can provide a common context file for semantic continuity, it will be prepended to each sentence's context window.
-* Choice of greedy algorithm or beam search to identify the most probable next word (will assemble next subtokens to reconstitute the word).
-* Minimalism over performance: simple loops used in place of batching, no CUDA, nothing fancy
-* Handles accented characters
-* Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
+* Can output surprisal features per LLM layer.
+* Extra left context: you can provide a common context file for semantic continuity, it will be prepended to each sentence's context window.
+* Can predict the n most probably next words, choice of greedy algorithm or beam search (will assemble next subtokens to reconstitute the word).
+* Handles accented characters. Languages tested: English, French.
 * Simple Command Line Interface, and scoring functions can easily be loaded from your own code.
 
+# Similar work
+* [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models with PLL or L2R, but no entropy.
+* [pangoling for R](https://docs.ropensci.org/pangoling/) Uses python internally. Does AR and masked too, but surprisal scores only.
+* [psychformers for python](https://github.com/jmichaelov/PsychFormers) Supports different types of models, but only does surprisal scores for now.
+* [lm-scorer](https://github.com/simonepri/lm-scorer) Focus is on scoring whole sentences, only surprisal scores.
+* [text for R](https://cran.r-project.org/web/packages/text/index.html) Does word embeddings computations, not surprisal-based features.
+
 ## Installation
-* You will need python, install if you don't have it already.
+* You will need python. Install if you don't have it already.
 * Install the libraries in requirements.txt:
 ```bash
 pip install -r requirements.txt
@@ -47,7 +53,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
 - `--top_k_cf_surprisal`: If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)
-- `--layers`: List of layer indices to compute surprisal from (e.g. `--layers 0 5 11`). Option `--layers all` is also possible. If not specified, only the last layer is used.
+- `--layers`: List of layer indices to compute surprisal from (e.g. `--layers 0 5 11`). Option `--layers all` is also possible. If not specified, only the last layer is used and only `surprisal_bits`/`entropy_bits` columns are written.
 
 #### AR Mode Options (GPT-style models)
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
@@ -79,6 +85,7 @@ python src/cli.py --input_file docs.tsv --format documents --mode ar --model gpt
 python src/cli.py --input_file data.tsv --mode mlm --model bert-base-uncased --output_file ./results/
 ```
 
+Layer-level surprisal works for AR and MLM: add `--layers` with specific indices or `--layers all` to dump surprisal and entropy at each transformer layer (new columns such as `layer3_surprisal_bits` will be appended).
 
 **Surprisal by specific layers:**
 ```bash
@@ -90,12 +97,10 @@ python src/cli.py --input_file data.tsv --mode ar --model gpt2 --layers 0 5 11
 python src/cli.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
 ```
 
-### Output Format
-
 
 #### Main Results File
 
-The output TSV contains:
+The output .tsv or parquet file contains:
 - `doc_id`, `sentence_id`, `token_index`: Identifiers
 - `token`: Raw token (with special characters like `▁`, `Ġ`)
 - `token_decoded`: Human-readable token
@@ -135,6 +140,11 @@ python test/test_basics.py
 Compare with minicons (MLM L2R scoring):
 ```bash
 python test/test_minicons_compare.py
+```
+
+Test the multiple layer analysis mode:
+```bash
+python test/test_layered_surprisal.py
 ```
 
 ## TODO
