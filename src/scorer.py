@@ -63,12 +63,15 @@ def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
     Returns raw tokens with special characters preserved.
     """
     probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
     top_probs, top_ids = torch.topk(probs, k)
-    
-    # Use convert_ids_to_tokens to preserve special characters
     top_tokens = tokenizer.convert_ids_to_tokens(top_ids.tolist())
-    
-    return top_tokens
+    # For each top token, also compute counterfactual surprisal
+    pred_info = []
+    for token, token_id in zip(top_tokens, top_ids.tolist()):
+        cf_surprisal = -log_probs[token_id].item() / LN2
+        pred_info.append((token, cf_surprisal))
+    return pred_info
 
 def decode_token(tokenizer, token_id: int, is_special: bool) -> Tuple[str, str]:
     """
@@ -179,9 +182,10 @@ def score_autoregressive(
                 else:
                     minimal_logits = logits[0] if len(logits) > 0 else None
 
+
             if minimal_logits is not None:
                 surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
-                top_k_tokens = get_top_k_predictions(minimal_logits, tokenizer, top_k)
+                top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k)
 
                 if lookahead_n > 0:
                     if lookahead_strategy == 'beam':
@@ -191,14 +195,14 @@ def score_autoregressive(
                 else:
                     lookahead = []
 
-                pred_col = top_k_tokens + lookahead
+                pred_col = top_k_preds + lookahead
             else:
                 surprisal = entropy = float('nan')
                 pred_col = [''] * (1 + top_k + lookahead_n)
 
         else:
             surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id)
-            top_k_tokens = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
+            top_k_preds = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
 
             if lookahead_n > 0:
                 if lookahead_strategy == 'beam':
@@ -208,7 +212,7 @@ def score_autoregressive(
             else:
                 lookahead = []
 
-            pred_col = top_k_tokens + lookahead
+            pred_col = top_k_preds + lookahead
 
         raw_tokens.append(raw_token)
         scored_tokens.append(token_str)
@@ -278,7 +282,7 @@ def score_masked_lm(
         logits = all_logits[sent_pos, combined_pos]
 
         surprisal, entropy = compute_surprisal_entropy(logits, target_id)
-        top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
+        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
 
         raw_token, token_str = decode_token(tokenizer, target_id, is_special)
 
@@ -287,7 +291,7 @@ def score_masked_lm(
         is_special_flags.append(is_special)
         surprisals.append(surprisal)
         entropies.append(entropy)
-        pred_columns.append(top_k_tokens)
+        pred_columns.append(top_k_preds)
 
     return ScoringResult(
         raw_tokens=raw_tokens,
@@ -391,11 +395,11 @@ def score_masked_lm_l2r(
         target_id = int(sentence_ids[sent_pos].item())
         logits = logits_batch[variant_idx, combined_pos]
         surp, ent = compute_surprisal_entropy(logits, target_id)
-        top_k_tokens = get_top_k_predictions(logits, tokenizer, top_k)
+        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
 
         surprisals[sent_pos] = surp
         entropies[sent_pos] = ent
-        pred_columns[sent_pos] = top_k_tokens
+        pred_columns[sent_pos] = top_k_preds
 
     return ScoringResult(
         raw_tokens=raw_tokens,

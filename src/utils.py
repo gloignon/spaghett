@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 from tqdm import tqdm
+import pandas as pd
 
 from scorer import (
     score_autoregressive,
@@ -173,19 +174,22 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
         raise ValueError(f"File '{input_file}' is not UTF-8 encoded: {e}")
     return data
 
-def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str):
-    """Write results to TSV with dynamic column headers."""
-    if not results:
-        return
+def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str, top_k_cf_surprisal: bool = False, output_format: str = 'tsv'):
     columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special',
                'surprisal_bits', 'entropy_bits']
     columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
     if mode == 'ar':
         columns += [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
-    with open(output_file, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=columns, delimiter='\t')
-        writer.writeheader()
-        writer.writerows(results)
+    df = pd.DataFrame(results)
+    df = df[columns]
+    if top_k_cf_surprisal:
+        for i in range(1, top_k + 1):
+            col = f'pred_alt_{i}'
+            df[col] = df[col].apply(lambda val: f'{val[0]}|{val[1]:.4f}' if isinstance(val, tuple) else val)
+    if output_format == 'parquet':
+        df.to_parquet(output_file, index=False)
+    else:
+        df.to_csv(output_file, sep='\t', index=False)
 
 # ============================================================================
 # Core processing function (I/O independent)
@@ -383,12 +387,16 @@ Examples:
                        help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
     parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
+    parser.add_argument('--top_k_cf_surprisal', action='store_true',
+        help='If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)')
     parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens (default: 3)')
     parser.add_argument('--lookahead_strategy', choices=['greedy', 'beam'], default='greedy',
                        help='AR: lookahead strategy - greedy or beam search (default: greedy)')
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
+        help='Output format: tsv (default) or parquet')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)

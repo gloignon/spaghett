@@ -6,13 +6,12 @@ spaghett is a simple python tool to extract surprisal-based features from text.
 * Works with AR and masked-token models from Hugging Face
 * L2R scoring is available when using a masked-token model. Results should be identical to minicons (tested in multiple situations: see test/test_minicons_compare.py).
 * Extracts surprisal, entropy and the next predicted word with the highest probability (i.e. what the LLM computed would be the continuation)
-* Extract attention weights - Get attention matrices (currently across all layers and heads) with optional fast-mode for attention-only extraction when no surprisal or entropy data is required.
 * Works sentence by sentence only (for now), but you can provide a common context file for semantic continuity, it will be prepended to each sentence's context window.
 * Choice of greedy algorithm or beam search to identify the most probable next word (will assemble next subtokens to reconstitute the word).
 * Minimalism over performance: simple loops used in place of batching, no CUDA, nothing fancy
-* Should not mess up accented characters
+* Handles accented characters
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
-* Simple Command Line Interface, no need to modify the code (but it should be easy to do so if you need to)
+* Simple Command Line Interface, no need to modify the code (but scoring functions can easily be loaded from your own code).
 
 ## Similar work
 * [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models (with PLL or L2R scoring), but no entropy and no next word. It does other stuff you might need.
@@ -51,8 +50,6 @@ python src/scorer.py --input_file <file> --mode <ar|mlm> --model <model_name> [o
 - `--format`: Input format - `documents` or `sentences` (default: `sentences`)
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
-- `--output_attentions`: Extract attention weights to separate `*_attention.tsv` file alongside main results
-- `--just_attentions`: **Fast mode** - ONLY extract attention weights (no surprisal/entropy/predictions), outputs only attention TSV
 
 #### AR Mode Options (GPT-style models)
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
@@ -74,15 +71,6 @@ python src/scorer.py --input_file data.tsv --mode ar --model gpt2
 python src/scorer.py --input_file in/demo_sentences.tsv --mode mlm --model cmarkea/distilcamembert-base --pll_metric within_word_l2r
 ```
 
-**Extract attention alongside surprisal/entropy:**
-```bash
-python src/scorer.py --input_file data.tsv --mode ar --model gpt2 --output_attentions
-```
-
-**Fast attention-only extraction (no scoring):**
-```bash
-python src/scorer.py --input_file data.tsv --mode mlm --model bert-base-uncased --just_attentions
-```
 
 **Documents format with context:**
 ```bash
@@ -115,24 +103,6 @@ The output TSV contains:
 
 **Note**: All special tokens are included in output. Filter using `is_special` column in post-processing if needed.
 
-#### Attention File (when using `--output_attentions` or `--just_attentions`)
-
-The `*_attention.tsv` file contains attention weights averaged across all layers and heads:
-- `doc_id`, `sentence_id`: Document and sentence identifiers
-- `token_id`: Position of source token (1-indexed)
-- `token`: Source token text (raw form with special characters)
-- `is_context`: Flag indicating if source token is from left context (1) or sentence (0)
-- `is_special`: Flag for special tokens
-- `rx_token_id`: Position of target token receiving attention (1-indexed)
-- `rx_token`: Target token text
-- `attn_score`: Attention weight from source to target (0-1, sums to ~1.0 per source token)
-
-**Notes on attention extraction:**
-- Includes attention between ALL tokens when left context is provided
-- Matrix size: (N_context + N_sentence) × (N_context + N_sentence) entries per sentence
-- Use `is_context=0` to filter for sentence-only attention patterns
-- `--just_attentions` mode is significantly faster as it skips all scoring computations
-
 ## Direct Function Calls
 
 You can also import and use the core functions directly in Python, for instance, assuming the scorer.py script is in the same folder:
@@ -141,28 +111,14 @@ You can also import and use the core functions directly in Python, for instance,
 from scorer import process_sentences
 
 # Standard scoring with predictions
-results, attention_data = process_sentences(
+results = process_sentences(
     sentences=["Hello world.", "How are you?"],
     mode='ar',
     model_name='gpt2',
     top_k=5,
     lookahead_n=3,
-    progress=True,
-    output_attentions=True  # Get attention weights
+    progress=True
 )
-
-# Fast attention-only extraction
-results, attention_data = process_sentences(
-    sentences=["Hello world.", "How are you?"],
-    mode='ar',
-    model_name='gpt2',
-    just_attentions=True  # Skip scoring, only get attention
-)
-
-# Process attention data
-for attn_row in attention_data:
-    print(f"Token {attn_row['token']} → {attn_row['rx_token']}: {attn_row['attn_score']}")
-```
 
 ## Testing
 
@@ -178,7 +134,6 @@ python test/test_minicons_compare.py
 
 ## TODO
 
-* Attention per layer/head
 * Create R wrapper/package
 * Add different context window modes (previous sentence, previous n words, full context, etc.)
 * Performance-optimized version with batching and GPU acceleration

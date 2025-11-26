@@ -15,3 +15,7 @@ typing-extensions>=4.0.0
 # Will only need if you want to run comparisons with minicons,
 # Such as the tests provided in test/test_minicons_compare.py
 minicons>=0.3
+
+# If you want to output parquet files
+pyarrow
+pandas
