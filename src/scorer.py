@@ -230,7 +230,7 @@ def score_autoregressive(
         pred_columns=pred_columns
     )
 
-
+# This is the original PLL scoring function
 def score_masked_lm(
     sentence: str,
     tokenizer,
@@ -302,7 +302,7 @@ def score_masked_lm(
         pred_columns=pred_columns
     )
 
-
+# This is the within-word left-to-right PLL scoring function
 def score_masked_lm_l2r(
     sentence: str,
     tokenizer,
@@ -503,7 +503,7 @@ def score_autoregressive_by_layers(
 
     with torch.no_grad():
         outputs = model(input_ids.unsqueeze(0), output_hidden_states=True)
-        logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
+        # logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
         hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
 
     # If no layers specified, use last layer only
@@ -615,7 +615,7 @@ def score_masked_lm_by_layers(
 
     with torch.no_grad():
         outputs = model(masked_batch, output_hidden_states=True)
-        all_logits = outputs.logits
+        # all_logits = outputs.logits
         hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
 
     # If no layers specified, use last layer only

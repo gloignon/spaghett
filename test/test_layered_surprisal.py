@@ -12,7 +12,11 @@ import pandas as pd
 src_path = Path(__file__).parent.parent / 'src'
 sys.path.insert(0, str(src_path))
 
-from scorer import score_autoregressive_by_layers, score_masked_lm_by_layers
+from scorer import (
+    score_autoregressive,
+    score_autoregressive_by_layers,
+    score_masked_lm_by_layers
+)
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 
 def test_ar_layered_surprisal():
@@ -68,7 +72,7 @@ def test_ar_all_layers():
     model = AutoModelForCausalLM.from_pretrained(model_name)
     sentence = "The cat sat on the mat."
     num_layers = len(model.transformer.h)
-    layers = list(range(num_layers))
+    layers = list(range(num_layers + 1))  # include embeddings (0) through final block
     results = score_autoregressive_by_layers(
         sentence=sentence,
         left_context="",
@@ -78,8 +82,24 @@ def test_ar_all_layers():
         top_k=2,
         lookahead_n=0
     )
+    # Default (no layers arg) should match last layer in layered scoring
+    default_res = score_autoregressive(
+        sentence=sentence,
+        left_context="",
+        tokenizer=tokenizer,
+        model=model,
+        top_k=2,
+        lookahead_n=0
+    )
     assert isinstance(results, dict)
     assert set(results.keys()) == set(layers)
+    last_layer_idx = layers[-1]
+    # Verify surprisal parity with default path
+    for layered_surp, default_surp in zip(results[last_layer_idx].surprisals, default_res.surprisals):
+        if math.isnan(layered_surp):
+            assert math.isnan(default_surp)
+        else:
+            assert math.isclose(layered_surp, default_surp, rel_tol=1e-6, abs_tol=1e-6)
     for layer_idx, res in results.items():
         assert len(res.surprisals) == len(res.scored_tokens)
         assert all(isinstance(s, float) for s in res.surprisals)
@@ -114,7 +134,7 @@ def test_cli_layers_all_ar():
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained("gpt2")
         num_layers = len(model.transformer.h)
-        for idx in range(num_layers):
+        for idx in range(num_layers + 1):
             assert f"layer{idx}_surprisal_bits" in df.columns
             assert f"layer{idx}_entropy_bits" in df.columns
 

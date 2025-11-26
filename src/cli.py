@@ -59,12 +59,14 @@ Examples:
                 from transformers import AutoModelForCausalLM
                 model = AutoModelForCausalLM.from_pretrained(args.model)
                 num_layers = len(model.transformer.h)
-                layers = list(range(num_layers))
+                # hidden_states includes embeddings at index 0, then one entry per block
+                layers = list(range(num_layers + 1))
             elif args.mode == "mlm":
                 from transformers import AutoModelForMaskedLM
                 model = AutoModelForMaskedLM.from_pretrained(args.model)
                 num_layers = model.config.num_hidden_layers
-                layers = list(range(num_layers))
+                # hidden_states includes embeddings at index 0, then one entry per block
+                layers = list(range(num_layers + 1))
             else:
                 layers = None
         else:
