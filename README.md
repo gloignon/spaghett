@@ -1,4 +1,4 @@
-# happybirthday
+# 🎁 happybirthday 🍰
 
 happybirthday is a python tool to extract surprisal-based features from text.
 You can also send the repo link to colleages and friends interested in computational linguistics as a nice gesture for their birthday.
@@ -14,13 +14,6 @@ You can also send the repo link to colleages and friends interested in computati
 * Should remain robust to LLM choice, as long as it is AR (GPT-style) or masked token.
 * Simple Command Line Interface, no need to modify the code (but scoring functions can easily be loaded from your own code).
 
-## Similar work
-* [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models (with PLL or L2R scoring), but no entropy and no next word. It does other stuff you might need.
-* [pangoling for R](https://docs.ropensci.org/pangoling/) Uses python internally. Does AR and masked too, but surprisal scores only.
-* [text for R](https://cran.r-project.org/web/packages/text/index.html) Does word embeddings computations, not surprisal-based features.
-* [psychformers for python](https://github.com/jmichaelov/PsychFormers) Supports different types of models, but only does surprisal scores for now.
-* [lm-scorer](https://github.com/simonepri/lm-scorer) Focus is on scoring whole sentences, only surprisal scores.
-  
 ## Installation
 * You will need python, install if you don't have it already.
 * Install the libraries in requirements.txt:
@@ -36,7 +29,7 @@ The first row is expected to be the column headers.
 ### Command Line Interface
 
 ```bash
-python src/scorer.py --input_file <file> --mode <ar|mlm> --model <model_name> [options]
+python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [options]
 ```
 
 #### Required Arguments
@@ -48,9 +41,12 @@ python src/scorer.py --input_file <file> --mode <ar|mlm> --model <model_name> [o
 - `--output_file`: Output path (default: auto-generated with timestamp)
   - Can be a specific filename: `results.tsv`
   - Can be a folder path: `./results/` (auto-generates filename inside your folder)
+- `--output_format`: Output format, either `tsv` (default) or `parquet`
 - `--format`: Input format - `documents` or `sentences` (default: `sentences`)
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
+- `--top_k_cf_surprisal`: If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)
+- `--left_context_file`: Path to text file for left context (prepended to each sentence)
 
 #### AR Mode Options (GPT-style models)
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
@@ -64,28 +60,27 @@ python src/scorer.py --input_file <file> --mode <ar|mlm> --model <model_name> [o
 
 **Basic usage (AR model):**
 ```bash
-python src/scorer.py --input_file data.tsv --mode ar --model gpt2
+python src/cli.py --input_file data.tsv --mode ar --model gpt2
 ```
 
 **French MLM with L2R scoring:**
 ```bash
-python src/scorer.py --input_file in/demo_sentences.tsv --mode mlm --model cmarkea/distilcamembert-base --pll_metric within_word_l2r
+python src/cli.py --input_file in/demo_sentences.tsv --mode mlm --model cmarkea/distilcamembert-base --pll_metric within_word_l2r
 ```
-
 
 **Documents format with context:**
 ```bash
-python src/scorer.py --input_file docs.tsv --format documents --mode ar --model gpt2 --left_context_file context.txt
+python src/cli.py --input_file docs.tsv --format documents --mode ar --model gpt2 --left_context_file context.txt
 ```
 
 **Output to specific folder:**
 ```bash
-python src/scorer.py --input_file data.tsv --mode mlm --model bert-base-uncased --output_file ./results/
+python src/cli.py --input_file data.tsv --mode mlm --model bert-base-uncased --output_file ./results/
 ```
 
 **AR with beam search lookahead:**
 ```bash
-python src/scorer.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
+python src/cli.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
 ```
 
 ### Output Format
@@ -120,12 +115,13 @@ results = process_sentences(
     lookahead_n=3,
     progress=True
 )
+```
 
 ## Testing
 
-Test direct call of scoring function:
+Test the basics:
 ```bash
-python test/test_direct_call.py
+python test/test_basics.py
 ```
 
 Compare with minicons (MLM L2R scoring):
