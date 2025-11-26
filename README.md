@@ -1,6 +1,7 @@
-# spaghett
+# happybirthday
 
-spaghett is a simple python tool to extract surprisal-based features from text. 
+happybirthday is a python tool to extract surprisal-based features from text.
+You can also send the repo link to colleages and friends interested in computational linguistics as a nice gesture for their birthday.
 
 ## Features
 * Works with AR and masked-token models from Hugging Face
