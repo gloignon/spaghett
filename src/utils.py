@@ -10,21 +10,12 @@ import math
 import os
 import re
 import sys
-from datetime import datetime
-from pathlib import Path
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 from tqdm import tqdm
 import pandas as pd
-
-from scorer import (
-    score_autoregressive,
-    score_masked_lm,
-    score_masked_lm_l2r
-)
 
 
 @dataclass
@@ -360,7 +351,9 @@ def process_from_file(
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
     pll_metric: str = 'original',
-    layers: Optional[list] = None
+    layers: Optional[list] = None,
+    top_k_cf_surprisal: bool = False,
+    output_format: str = 'tsv'
 ):
     """
     Process input TSV file and write output TSV file.
@@ -399,7 +392,15 @@ def process_from_file(
             pll_metric=pll_metric,
             layers=layers
         )
-        write_output(output_file, results, top_k, lookahead_n, mode)
+        write_output(
+            output_file,
+            results,
+            top_k,
+            lookahead_n,
+            mode,
+            top_k_cf_surprisal=top_k_cf_surprisal,
+            output_format=output_format
+        )
         print(f"Results written to: {output_file}")
     except FileNotFoundError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)

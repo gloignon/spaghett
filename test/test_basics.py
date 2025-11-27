@@ -48,6 +48,7 @@ import tempfile
 import os
 import pandas as pd
 import sys
+import subprocess
 from pathlib import Path
 import pytest
 import math
@@ -255,6 +256,36 @@ def test_empty_sentence_mlm(mlm_model):
     
     assert len(result.scored_tokens) == 0
     assert len(result.surprisals) == 0
+
+
+def test_cli_parquet_output_flag(tmp_path):
+    """Ensure CLI writes real parquet when requested (not TSV with wrong extension)."""
+    input_path = tmp_path / "input.tsv"
+    input_path.write_text("doc_id\tsentence_id\tsentence\n1\t1\tHello world\n", encoding="utf-8")
+    output_path = tmp_path / "out.parquet"
+    cli_path = str(Path(__file__).parent.parent / "src" / "cli.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            cli_path,
+            "--input_file", str(input_path),
+            "--output_file", str(output_path),
+            "--mode", "ar",
+            "--model", "gpt2",
+            "--output_format", "parquet",
+            "--top_k", "0",
+            "--lookahead_n", "0"
+        ],
+        capture_output=True,
+        text=True
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+    assert output_path.exists(), "No output parquet file created"
+    with open(output_path, "rb") as f:
+        magic = f.read(4)
+    assert magic == b"PAR1", f"Output is not parquet (magic bytes {magic})"
+    df = pd.read_parquet(output_path)
+    assert not df.empty
 
 
 if __name__ == "__main__":

@@ -109,7 +109,9 @@ Examples:
         lookahead_strategy=args.lookahead_strategy,
         beam_width=args.beam_width,
         pll_metric=args.pll_metric,
-        layers=layers
+        layers=layers,
+        top_k_cf_surprisal=args.top_k_cf_surprisal,
+        output_format=args.output_format
     )
 
 if __name__ == "__main__":
