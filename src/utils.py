@@ -27,6 +27,7 @@ class ScoringConfig:
     top_k: int = 3
     lookahead_n: int = 3  # Default for AR, will be adjusted in __post_init__
     beam_width: int = 3
+    temperature: float = 1.0
 
     _VALID_MODES = frozenset({'ar', 'mlm'})
     _VALID_STRATEGIES = frozenset({'greedy', 'beam'})
@@ -52,6 +53,8 @@ class ScoringConfig:
             errors.append(f"beam_width must be >= 1, got {self.beam_width}")
         if self.pll_metric not in self._VALID_PLL:
             errors.append(f"pll_metric must be one of {sorted(self._VALID_PLL)}, got '{self.pll_metric}'")
+        if self.temperature <= 0:
+            errors.append(f"temperature must be > 0, got {self.temperature}")
         if self.mode == 'ar':
             if self.pll_metric != 'original':
                 errors.append(f"pll_metric is only applicable in MLM mode, got '{self.pll_metric}'")
@@ -207,7 +210,8 @@ def process_sentences(
     sentence_ids: List[str] = None,
     progress: bool = True,
     pll_metric: str = 'original',
-    layers: Optional[List[int]] = None
+    layers: Optional[List[int]] = None,
+    temperature: float = 1.0
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -216,7 +220,8 @@ def process_sentences(
         lookahead_n=lookahead_n,
         lookahead_strategy=lookahead_strategy,
         beam_width=beam_width,
-        pll_metric=pll_metric
+        pll_metric=pll_metric,
+        temperature=temperature
     )
     config.validate()
     if doc_ids is None:
@@ -242,27 +247,27 @@ def process_sentences(
             if layers is not None:
                 score_fn = lambda s: score_autoregressive_by_layers(
                     s, left_context, tokenizer, model, layers, top_k, lookahead_n,
-                    lookahead_strategy, beam_width, context_ids
+                    lookahead_strategy, beam_width, context_ids, temperature
                 )
             else:
                 score_fn = lambda s: score_autoregressive(
                     s, left_context, tokenizer, model, top_k, lookahead_n,
-                    lookahead_strategy, beam_width, context_ids
+                    lookahead_strategy, beam_width, context_ids, temperature
                 )
         elif mode == 'mlm':
             from scorer import score_masked_lm_by_layers, score_masked_lm, score_masked_lm_l2r
             model = AutoModelForMaskedLM.from_pretrained(model_name)
             if layers is not None:
                 score_fn = lambda s: score_masked_lm_by_layers(
-                    s, tokenizer, model, layers, top_k, context_ids
+                    s, tokenizer, model, layers, top_k, context_ids, temperature
                 )
             elif pll_metric == 'within_word_l2r':
                 score_fn = lambda s: score_masked_lm_l2r(
-                    s, tokenizer, model, top_k, context_ids
+                    s, tokenizer, model, top_k, context_ids, temperature
                 )
             else:
                 score_fn = lambda s: score_masked_lm(
-                    s, tokenizer, model, top_k, context_ids
+                    s, tokenizer, model, top_k, context_ids, temperature
                 )
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'ar' or 'mlm'")
@@ -353,7 +358,8 @@ def process_from_file(
     pll_metric: str = 'original',
     layers: Optional[list] = None,
     top_k_cf_surprisal: bool = False,
-    output_format: str = 'tsv'
+    output_format: str = 'tsv',
+    temperature: float = 1.0
 ):
     """
     Process input TSV file and write output TSV file.
@@ -390,7 +396,8 @@ def process_from_file(
             sentence_ids=sentence_ids,
             progress=True,
             pll_metric=pll_metric,
-            layers=layers
+            layers=layers,
+            temperature=temperature
         )
         write_output(
             output_file,
