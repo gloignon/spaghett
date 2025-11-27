@@ -42,6 +42,8 @@ Examples:
         help='Optional: list of layer indices to compute surprisal from, e.g. [0,5,7] or all for all layers. Default: last layer only.')
     parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
         help='Output format: tsv (default) or parquet')
+    parser.add_argument('--temperature', type=float, default=1.0,
+        help='Temperature scaling for surprisal/entropy (must be > 0)')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -111,7 +113,8 @@ Examples:
         pll_metric=args.pll_metric,
         layers=layers,
         top_k_cf_surprisal=args.top_k_cf_surprisal,
-        output_format=args.output_format
+        output_format=args.output_format,
+        temperature=args.temperature
     )
 
 if __name__ == "__main__":

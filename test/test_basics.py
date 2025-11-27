@@ -203,6 +203,38 @@ def test_score_masked_lm(mlm_model):
             assert isinstance(token, str)
             assert isinstance(cf_surprisal, float)
 
+def test_temperature_scaling_changes_surprisal(ar_model):
+    """Temperature should alter surprisal values for the same logits."""
+    tokenizer, model = ar_model
+    sentence = "The cat sat on the mat."
+    base = score_autoregressive(
+        sentence=sentence,
+        left_context="",
+        tokenizer=tokenizer,
+        model=model,
+        top_k=0,
+        lookahead_n=0,
+        temperature=1.0
+    )
+    hot = score_autoregressive(
+        sentence=sentence,
+        left_context="",
+        tokenizer=tokenizer,
+        model=model,
+        top_k=0,
+        lookahead_n=0,
+        temperature=2.0
+    )
+    assert len(base.surprisals) == len(hot.surprisals)
+    # Find first finite surprisal and ensure it shifts with temperature
+    for s1, s2 in zip(base.surprisals, hot.surprisals):
+        if math.isnan(s1) or math.isnan(s2):
+            continue
+        assert not math.isclose(s1, s2, rel_tol=1e-6, abs_tol=1e-6)
+        break
+    else:
+        pytest.fail("No finite surprisals to compare")
+
 
 def test_score_masked_lm_l2r(mlm_model):
     """Test masked LM with left-to-right within-word scoring."""

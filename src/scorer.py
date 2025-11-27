@@ -46,24 +46,30 @@ def prepare_input_with_context(sentence_ids: torch.Tensor, context_ids: List[int
         sentence_start = 0
     return input_ids, sentence_start
 
-def compute_surprisal_entropy(logits: torch.Tensor, target_id: int) -> Tuple[float, float]:
-    """Compute surprisal and entropy from logits."""
-    probs = torch.softmax(logits, dim=-1)
-    log_probs = torch.log_softmax(logits, dim=-1)
-    
+def compute_surprisal_entropy(
+    logits: torch.Tensor,
+    target_id: int,
+    temperature: float = 1.0
+) -> Tuple[float, float]:
+    """Compute surprisal and entropy from logits with optional temperature scaling."""
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    scaled = logits / temperature
+    probs = torch.softmax(scaled, dim=-1)
+    log_probs = torch.log_softmax(scaled, dim=-1)
     surprisal = -log_probs[target_id].item() / LN2
     entropy = -(probs * log_probs).sum().item() / LN2
-    
     return surprisal, entropy
 
 
-def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int) -> List[str]:
+def get_top_k_predictions(logits: torch.Tensor, tokenizer, k: int, temperature: float = 1.0) -> List[str]:
     """
     Get the top-k most probable tokens.
     Returns raw tokens with special characters preserved.
     """
-    probs = torch.softmax(logits, dim=-1)
-    log_probs = torch.log_softmax(logits, dim=-1)
+    scaled = logits / temperature
+    probs = torch.softmax(scaled, dim=-1)
+    log_probs = torch.log_softmax(scaled, dim=-1)
     top_probs, top_ids = torch.topk(probs, k)
     top_tokens = tokenizer.convert_ids_to_tokens(top_ids.tolist())
     # For each top token, also compute counterfactual surprisal
@@ -136,7 +142,8 @@ def score_autoregressive(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    temperature: float = 1.0
 ) -> ScoringResult:
     """
     Score sentence with AR model.
@@ -184,8 +191,8 @@ def score_autoregressive(
 
 
             if minimal_logits is not None:
-                surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
-                top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k)
+                surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id, temperature)
+                top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k, temperature)
 
                 if lookahead_n > 0:
                     if lookahead_strategy == 'beam':
@@ -201,8 +208,8 @@ def score_autoregressive(
                 pred_col = [''] * (1 + top_k + lookahead_n)
 
         else:
-            surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id)
-            top_k_preds = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k)
+            surprisal, entropy = compute_surprisal_entropy(logits[combined_pos - 1], target_id, temperature)
+            top_k_preds = get_top_k_predictions(logits[combined_pos - 1], tokenizer, top_k, temperature)
 
             if lookahead_n > 0:
                 if lookahead_strategy == 'beam':
@@ -236,7 +243,8 @@ def score_masked_lm(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    temperature: float = 1.0
 ) -> ScoringResult:
     """
     Score sentence with MLM using parallel masking (original PLL).
@@ -281,8 +289,8 @@ def score_masked_lm(
 
         logits = all_logits[sent_pos, combined_pos]
 
-        surprisal, entropy = compute_surprisal_entropy(logits, target_id)
-        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
+        surprisal, entropy = compute_surprisal_entropy(logits, target_id, temperature)
+        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k, temperature)
 
         raw_token, token_str = decode_token(tokenizer, target_id, is_special)
 
@@ -308,7 +316,8 @@ def score_masked_lm_l2r(
     tokenizer,
     model,
     top_k: int = 5,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    temperature: float = 1.0
 ) -> ScoringResult:
     """
     Score sentence with MLM using within_word_l2r (minicons-compatible).
@@ -394,8 +403,8 @@ def score_masked_lm_l2r(
     for variant_idx, (sent_pos, combined_pos) in enumerate(variant_targets):
         target_id = int(sentence_ids[sent_pos].item())
         logits = logits_batch[variant_idx, combined_pos]
-        surp, ent = compute_surprisal_entropy(logits, target_id)
-        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
+        surp, ent = compute_surprisal_entropy(logits, target_id, temperature)
+        top_k_preds = get_top_k_predictions(logits, tokenizer, top_k, temperature)
 
         surprisals[sent_pos] = surp
         entropies[sent_pos] = ent
@@ -483,7 +492,8 @@ def score_autoregressive_by_layers(
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    temperature: float = 1.0
 ) -> dict:
     """
     Compute surprisal for specified layers in AR model.
@@ -542,8 +552,8 @@ def score_autoregressive_by_layers(
                         minimal_logits = layer_logits[0] if len(layer_logits) > 0 else None
 
                 if minimal_logits is not None:
-                    surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id)
-                    top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k)
+                    surprisal, entropy = compute_surprisal_entropy(minimal_logits, target_id, temperature)
+                    top_k_preds = get_top_k_predictions(minimal_logits, tokenizer, top_k, temperature)
                     lookahead = []
                     if lookahead_n > 0:
                         lookahead = []  # Not supported for non-final layers
@@ -552,8 +562,8 @@ def score_autoregressive_by_layers(
                     surprisal = entropy = float('nan')
                     pred_col = [''] * (1 + top_k + lookahead_n)
             else:
-                surprisal, entropy = compute_surprisal_entropy(layer_logits[combined_pos - 1], target_id)
-                top_k_preds = get_top_k_predictions(layer_logits[combined_pos - 1], tokenizer, top_k)
+                surprisal, entropy = compute_surprisal_entropy(layer_logits[combined_pos - 1], target_id, temperature)
+                top_k_preds = get_top_k_predictions(layer_logits[combined_pos - 1], tokenizer, top_k, temperature)
                 lookahead = []
                 if lookahead_n > 0:
                     lookahead = []  # Not supported for non-final layers
@@ -582,7 +592,8 @@ def score_masked_lm_by_layers(
     model,
     layers: Optional[List[int]] = None,
     top_k: int = 5,
-    context_ids: List[int] = None
+    context_ids: List[int] = None,
+    temperature: float = 1.0
 ) -> dict:
     """
     Compute surprisal for specified layers in MLM model.
@@ -667,8 +678,8 @@ def score_masked_lm_by_layers(
             target_id = sentence_ids[sent_pos].item()
             is_special = 1 if special_mask[sent_pos] else 0
             logits = layer_logits[sent_pos, combined_pos]
-            surprisal, entropy = compute_surprisal_entropy(logits, target_id)
-            top_k_preds = get_top_k_predictions(logits, tokenizer, top_k)
+            surprisal, entropy = compute_surprisal_entropy(logits, target_id, temperature)
+            top_k_preds = get_top_k_predictions(logits, tokenizer, top_k, temperature)
             raw_token, token_str = decode_token(tokenizer, target_id, is_special)
             raw_tokens.append(raw_token)
             scored_tokens.append(token_str)
