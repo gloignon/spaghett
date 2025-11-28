@@ -86,7 +86,8 @@ Examples:
             parts.append(f'beam{args.beam_width}')
     if args.pll_metric == 'within_word_l2r':
         parts.append('L2R')
-    generated_filename = '_'.join(parts + [timestamp]) + '.tsv'
+    desired_ext = '.parquet' if args.output_format == 'parquet' else '.tsv'
+    generated_filename = '_'.join(parts + [timestamp]) + desired_ext
     output_path = Path(args.output_file)
     if output_path.is_dir() or (not output_path.exists() and output_path.suffix == ''):
         output_path.mkdir(parents=True, exist_ok=True)

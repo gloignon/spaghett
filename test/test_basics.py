@@ -320,5 +320,37 @@ def test_cli_parquet_output_flag(tmp_path):
     assert not df.empty
 
 
+def test_cli_parquet_output_directory(tmp_path):
+    """When output_format is parquet and output_file is a dir, generate a .parquet file with parquet content."""
+    input_path = tmp_path / "input.tsv"
+    input_path.write_text("doc_id\tsentence_id\tsentence\n1\t1\tHello folder\n", encoding="utf-8")
+    output_dir = tmp_path / "folder_out"
+    cli_path = str(Path(__file__).parent.parent / "src" / "cli.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            cli_path,
+            "--input_file", str(input_path),
+            "--output_file", str(output_dir),
+            "--mode", "ar",
+            "--model", "gpt2",
+            "--output_format", "parquet",
+            "--top_k", "0",
+            "--lookahead_n", "0"
+        ],
+        capture_output=True,
+        text=True
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+    outputs = list(output_dir.glob("*.parquet"))
+    assert len(outputs) == 1, "Expected one parquet file in output directory"
+    parquet_file = outputs[0]
+    with open(parquet_file, "rb") as f:
+        magic = f.read(4)
+    assert magic == b"PAR1", f"Output is not parquet (magic bytes {magic})"
+    df = pd.read_parquet(parquet_file)
+    assert not df.empty
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
