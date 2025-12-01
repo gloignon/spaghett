@@ -321,7 +321,9 @@ class IncrementalWriter:
         top_k: int,
         lookahead_n: int,
         top_k_cf_surprisal: bool = False,
-        output_format: str = 'tsv'
+        output_format: str = 'tsv',
+        resume: bool = False,
+        existing_rows: int = 0
     ):
         self.output_file = output_file
         self.output_format = output_format
@@ -330,22 +332,34 @@ class IncrementalWriter:
         self.mode = mode
         self.top_k_cf_surprisal = top_k_cf_surprisal
         self.columns = build_output_columns(layers, top_k, lookahead_n, mode)
-        self.total_rows = 0
+        self.total_rows = existing_rows
+        self.resume = resume
 
         self._csv_handle = None
         self._csv_writer = None
         self._parquet_writer = None
         self._parquet = None
+        self._parquet_schema = None
+        self._parquet_base_table = None
+        self._parquet_resume = False
 
         if output_format == 'tsv':
-            self._csv_handle = open(output_file, 'w', encoding='utf-8', newline='')
+            mode_flag = 'a' if resume else 'w'
+            self._csv_handle = open(output_file, mode_flag, encoding='utf-8', newline='')
             self._csv_writer = csv.DictWriter(self._csv_handle, fieldnames=self.columns, delimiter='\t', extrasaction='ignore')
-            self._csv_writer.writeheader()
+            # Write header unless we are resuming and the file is non-empty
+            if not resume or os.path.getsize(output_file) == 0:
+                self._csv_writer.writeheader()
         elif output_format == 'parquet':
             try:
                 import pyarrow as pa
                 import pyarrow.parquet as pq
                 self._parquet = (pa, pq)
+                if resume and os.path.exists(output_file):
+                    # Load existing table once; we'll rewrite with existing rows then append new ones
+                    self._parquet_base_table = pq.read_table(output_file)
+                    self._parquet_schema = self._parquet_base_table.schema
+                    self._parquet_resume = True
             except Exception as e:
                 raise ImportError("pyarrow is required for incremental parquet writing") from e
         else:
@@ -369,7 +383,10 @@ class IncrementalWriter:
             df = df.reindex(columns=self.columns, fill_value='')
             table = pa.Table.from_pandas(df, preserve_index=False)
             if self._parquet_writer is None:
-                self._parquet_writer = pq.ParquetWriter(self.output_file, table.schema)
+                schema = self._parquet_schema or table.schema
+                self._parquet_writer = pq.ParquetWriter(self.output_file, schema)
+                if self._parquet_resume and self._parquet_base_table is not None:
+                    self._parquet_writer.write_table(self._parquet_base_table)
             self._parquet_writer.write_table(table)
         self.total_rows += len(rows)
 
@@ -380,6 +397,33 @@ class IncrementalWriter:
         if self._parquet_writer:
             self._parquet_writer.close()
             self._parquet_writer = None
+
+
+def load_completed_docs(output_file: str, output_format: str) -> Tuple[set, int]:
+    """
+    Load completed doc_ids from an existing output file for resume.
+    Returns (doc_id_set, row_count).
+    """
+    if not os.path.exists(output_file):
+        return set(), 0
+    if output_format == 'tsv':
+        doc_ids = set()
+        count = 0
+        with open(output_file, encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                doc_id = row.get('doc_id')
+                if doc_id:
+                    doc_ids.add(doc_id)
+                count += 1
+        return doc_ids, count
+    elif output_format == 'parquet':
+        try:
+            df = pd.read_parquet(output_file, columns=['doc_id'])
+        except Exception:
+            return set(), 0
+        return set(df['doc_id'].dropna().astype(str).tolist()), len(df)
+    return set(), 0
 
 # ============================================================================
 # Core processing function (I/O independent)
@@ -402,7 +446,8 @@ def process_sentences(
     temperature: float = 1.0,
     logger: Optional[logging.Logger] = None,
     writer: Optional[IncrementalWriter] = None,
-    flush_by_doc: bool = False
+    flush_by_doc: bool = False,
+    skip_doc_ids: Optional[set] = None
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -488,6 +533,8 @@ def process_sentences(
         desc = "Processing"
         iterator = tqdm(iterator, total=len(sentences), desc=desc)
     for doc_id, sent_id, sentence in iterator:
+        if skip_doc_ids and doc_id in skip_doc_ids:
+            continue
         if writer and flush_by_doc:
             if current_doc is None:
                 current_doc = doc_id
@@ -586,7 +633,8 @@ def process_from_file(
     output_format: str = 'tsv',
     temperature: float = 1.0,
     log_file: str = '',
-    max_sentence_words: int = 0
+    max_sentence_words: int = 0,
+    resume: bool = False
 ):
     """
     Process input TSV file and write output TSV file.
@@ -628,6 +676,12 @@ def process_from_file(
         doc_ids = [item[0] for item in data]
         sentence_ids = [item[1] for item in data]
         sentences = [item[2] for item in data]
+        completed_docs = set()
+        existing_rows = 0
+        if resume and os.path.exists(output_file):
+            completed_docs, existing_rows = load_completed_docs(output_file, output_format)
+            logger.info("Resuming: found %s completed doc_id(s), %s rows in %s", len(completed_docs), existing_rows, output_file)
+
         writer = None
         try:
             writer = IncrementalWriter(
@@ -637,9 +691,13 @@ def process_from_file(
                 top_k=top_k,
                 lookahead_n=lookahead_n,
                 top_k_cf_surprisal=top_k_cf_surprisal,
-                output_format=output_format
+                output_format=output_format,
+                resume=resume and os.path.exists(output_file),
+                existing_rows=existing_rows
             )
         except Exception as e:
+            if resume:
+                raise
             if logger:
                 logger.warning("Falling back to batch write: %s", e)
             writer = None
@@ -661,7 +719,8 @@ def process_from_file(
             temperature=temperature,
             logger=logger,
             writer=writer,
-            flush_by_doc=True
+            flush_by_doc=True,
+            skip_doc_ids=completed_docs if completed_docs else None
         )
         if writer:
             writer.close()
@@ -676,7 +735,7 @@ def process_from_file(
                 top_k_cf_surprisal=top_k_cf_surprisal,
                 output_format=output_format
             )
-            rows_written = len(results)
+            rows_written = existing_rows + len(results) if resume else len(results)
 
         if 'logger' in locals():
             logger.info(f"Completed run; wrote {rows_written} rows to {output_file}")
@@ -695,5 +754,3 @@ def process_from_file(
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-

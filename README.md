@@ -61,6 +61,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 - `--lookahead_n`: Number of continuation tokens to generate (default: `3`, use `0` to disable)
 - `--lookahead_strategy`: Generation strategy - `greedy` or `beam` (default: `greedy`)
 - `--beam_width`: Beam width for beam search (default: `3`, only used with `--lookahead_strategy beam`)
+- `--resume`: Resume from an existing output file (skip already-scored `doc_id`s and append new rows)
 
 #### MLM Mode Options (BERT-style models)
 - `--pll_metric`: Scoring variant - `original` or `within_word_l2r` (default: `original`)

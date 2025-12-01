@@ -48,6 +48,8 @@ Examples:
         help='Temperature scaling for surprisal/entropy (must be > 0)')
     parser.add_argument('--log_file', default='',
         help='Optional log file path. Defaults to <output_file>.log')
+    parser.add_argument('--resume', action='store_true',
+        help='Resume from an existing output file: skip already-scored doc_ids and append new results')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -120,7 +122,8 @@ Examples:
         output_format=args.output_format,
         temperature=args.temperature,
         log_file=args.log_file,
-        max_sentence_words=args.max_sentence_words
+        max_sentence_words=args.max_sentence_words,
+        resume=args.resume
     )
 
 if __name__ == "__main__":
