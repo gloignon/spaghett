@@ -96,6 +96,33 @@ def simple_sentence_split(text: str) -> List[str]:
     return [s for s in sentences if s]
 
 
+def split_sentence_by_words(sentence: str, max_words: int) -> List[str]:
+    """
+    Split a sentence into chunks with at most max_words words.
+    """
+    if max_words <= 0:
+        return [sentence]
+
+    words = sentence.split()
+    if not words or len(words) <= max_words:
+        return [sentence]
+
+    chunks: List[str] = []
+    current: List[str] = []
+
+    for word in words:
+        if len(current) + 1 > max_words:
+            chunks.append(' '.join(current))
+            current = [word]
+        else:
+            current.append(word)
+
+    if current:
+        chunks.append(' '.join(current))
+
+    return chunks if chunks else [sentence]
+
+
 def read_left_context(path: str) -> str:
     """Read left context from file, strip whitespace."""
     if not os.path.exists(path):
@@ -186,6 +213,44 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
     except UnicodeDecodeError as e:
         raise ValueError(f"File '{input_file}' is not UTF-8 encoded: {e}")
     return data
+
+
+def split_long_inputs(
+    rows: List[Tuple[str, str, str]],
+    max_sentence_words: int = 0,
+    logger: Optional[logging.Logger] = None
+) -> Tuple[List[Tuple[str, str, str]], dict]:
+    """
+    Split sentences longer than the configured limits into multiple chunks.
+
+    Returns:
+        (expanded_rows, stats)
+        stats = {"split_sentences": int, "total_chunks": int}
+    """
+    if max_sentence_words <= 0:
+        return rows, {"split_sentences": 0, "total_chunks": len(rows)}
+
+    expanded: List[Tuple[str, str, str]] = []
+    split_count = 0
+    for doc_id, sent_id, sentence in rows:
+        chunks = split_sentence_by_words(sentence, max_sentence_words)
+
+        if len(chunks) > 1:
+            split_count += 1
+        for idx, chunk in enumerate(chunks, 1):
+            new_sent_id = sent_id if len(chunks) == 1 else f"{sent_id}.{idx}"
+            expanded.append((doc_id, new_sent_id, chunk))
+
+    stats = {"split_sentences": split_count, "total_chunks": len(expanded)}
+    if logger and split_count:
+        logger.info(
+            "Split %s long sentence(s) into %s chunk(s) (max_words=%s)",
+            split_count,
+            stats["total_chunks"],
+            max_sentence_words
+        )
+    return expanded, stats
+
 
 def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str, top_k_cf_surprisal: bool = False, output_format: str = 'tsv'):
     columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special']
@@ -391,12 +456,14 @@ def process_from_file(
     top_k_cf_surprisal: bool = False,
     output_format: str = 'tsv',
     temperature: float = 1.0,
-    log_file: str = ''
+    log_file: str = '',
+    max_sentence_words: int = 0
 ):
     """
     Process input TSV file and write output TSV file.
     
     This function handles I/O for CLI usage.
+    Set max_sentence_words > 0 to split overly long sentences before scoring.
     """
     try:
         left_context = ''
@@ -416,9 +483,11 @@ def process_from_file(
         # Print the log file path so users (and tests) see where logs are written
         print(f"Logging to: {log_path}")
         logger = setup_logger(log_path)
+        data, _split_stats = split_long_inputs(data, max_sentence_words, logger)
         logger.info(
             f"Starting run | mode={mode} model={model_name} "
-            f"input={input_file} output={output_file} pll_metric={pll_metric} layers={layers}"
+            f"input={input_file} output={output_file} pll_metric={pll_metric} layers={layers} "
+            f"max_sentence_words={max_sentence_words} sentences={len(data)}"
         )
         if not data:
             print(f"Warning: No valid data found in {input_file}")

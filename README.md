@@ -50,6 +50,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
   - Can be a folder path: `./results/` (auto-generates filename inside your folder)
 - `--output_format`: Output format, either `tsv` (default) or `parquet`
 - `--format`: Input format - `documents` or `sentences` (default: `sentences`)
+- `--max_sentence_words`: Split sentences longer than this many whitespace-separated words before scoring (default: disabled)
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
 - `--top_k_cf_surprisal`: If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)

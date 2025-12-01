@@ -28,6 +28,8 @@ Examples:
                        help='HuggingFace model name (e.g., "gpt2", "bert-base-uncased")')
     parser.add_argument('--format', choices=['documents', 'sentences'], default="sentences",
                        help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
+    parser.add_argument('--max_sentence_words', type=int, default=0,
+                       help='Split sentences longer than this many words (0 disables, default)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
     parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
     parser.add_argument('--top_k_cf_surprisal', action='store_true',
@@ -117,7 +119,8 @@ Examples:
         top_k_cf_surprisal=args.top_k_cf_surprisal,
         output_format=args.output_format,
         temperature=args.temperature,
-        log_file=args.log_file
+        log_file=args.log_file,
+        max_sentence_words=args.max_sentence_words
     )
 
 if __name__ == "__main__":
