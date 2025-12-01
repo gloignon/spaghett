@@ -447,7 +447,8 @@ def process_sentences(
     logger: Optional[logging.Logger] = None,
     writer: Optional[IncrementalWriter] = None,
     flush_by_doc: bool = False,
-    skip_doc_ids: Optional[set] = None
+    skip_doc_ids: Optional[set] = None,
+    mlm_batch_size: int = 0
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -496,7 +497,7 @@ def process_sentences(
             model = AutoModelForMaskedLM.from_pretrained(model_name)
             if layers is not None:
                 score_fn = lambda s: score_masked_lm_by_layers(
-                    s, tokenizer, model, layers, top_k, context_ids, temperature
+                    s, tokenizer, model, layers, top_k, context_ids, temperature, mlm_batch_size
                 )
             elif pll_metric == 'within_word_l2r':
                 score_fn = lambda s: score_masked_lm_l2r(
@@ -634,7 +635,8 @@ def process_from_file(
     temperature: float = 1.0,
     log_file: str = '',
     max_sentence_words: int = 0,
-    resume: bool = False
+    resume: bool = False,
+    mlm_batch_size: int = 0
 ):
     """
     Process input TSV file and write output TSV file.
@@ -720,7 +722,8 @@ def process_from_file(
             logger=logger,
             writer=writer,
             flush_by_doc=True,
-            skip_doc_ids=completed_docs if completed_docs else None
+            skip_doc_ids=completed_docs if completed_docs else None,
+            mlm_batch_size=mlm_batch_size
         )
         if writer:
             writer.close()

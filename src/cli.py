@@ -40,6 +40,8 @@ Examples:
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    parser.add_argument('--mlm_batch_size', type=int, default=0,
+                        help='MLM: mini-batch size for per-token masks when scoring layers (0 = process all at once)')
     parser.add_argument('--layers', nargs='*', default=None,
         help='Optional: list of layer indices to compute surprisal from, e.g. [0,5,7] or all for all layers. Default: last layer only.')
     parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
@@ -123,7 +125,8 @@ Examples:
         temperature=args.temperature,
         log_file=args.log_file,
         max_sentence_words=args.max_sentence_words,
-        resume=args.resume
+        resume=args.resume,
+        mlm_batch_size=args.mlm_batch_size
     )
 
 if __name__ == "__main__":
