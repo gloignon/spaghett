@@ -10,6 +10,9 @@ import math
 import os
 import re
 import sys
+import logging
+from datetime import datetime
+from pathlib import Path
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -65,6 +68,22 @@ class ScoringConfig:
             raise ValueError(f"Invalid scoring configuration:\n  • {bullet}")
 
 LN2 = math.log(2.0)
+
+def setup_logger(log_file: Optional[str] = None, level: int = logging.INFO) -> logging.Logger:
+    """Create or return a shared logger for CLI processing."""
+    logger = logging.getLogger("spaghett")
+    if logger.handlers:
+        return logger
+    logger.setLevel(level)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger
 
 
 # ============================================================================
@@ -211,7 +230,8 @@ def process_sentences(
     progress: bool = True,
     pll_metric: str = 'original',
     layers: Optional[List[int]] = None,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    logger: Optional[logging.Logger] = None
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -224,6 +244,7 @@ def process_sentences(
         temperature=temperature
     )
     config.validate()
+    logger = logger or logging.getLogger("spaghett")
     if doc_ids is None:
         doc_ids = ['doc1'] * len(sentences)
     if sentence_ids is None:
@@ -287,7 +308,17 @@ def process_sentences(
         desc = "Processing"
         iterator = tqdm(iterator, total=len(sentences), desc=desc)
     for doc_id, sent_id, sentence in iterator:
-        result = score_fn(sentence)
+        if logger:
+            logger.info(f"Scoring doc_id={doc_id} sentence_id={sent_id}")
+        try:
+            result = score_fn(sentence)
+        except Exception as e:
+            if logger:
+                logger.error(
+                    f"Failed while scoring doc_id={doc_id} sentence_id={sent_id}: {type(e).__name__}: {e}",
+                    exc_info=True
+                )
+            raise
         if layers is not None and isinstance(result, dict):
             # Multiple layers: result is {layer_idx: ScoringResult}
             num_tokens = len(next(iter(result.values())).scored_tokens)
@@ -359,7 +390,8 @@ def process_from_file(
     layers: Optional[list] = None,
     top_k_cf_surprisal: bool = False,
     output_format: str = 'tsv',
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    log_file: str = ''
 ):
     """
     Process input TSV file and write output TSV file.
@@ -373,6 +405,21 @@ def process_from_file(
             left_context = read_left_context(left_context_file)
         print(f"Loading input from: {input_file}")
         data = load_input_data(input_file, format_type)
+        if log_file:
+            log_path = log_file
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_path = Path(output_file)
+            log_name = f"{base_path.stem}_{ts}.log"
+            log_path = str(base_path.with_name(log_name))
+        os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+        # Print the log file path so users (and tests) see where logs are written
+        print(f"Logging to: {log_path}")
+        logger = setup_logger(log_path)
+        logger.info(
+            f"Starting run | mode={mode} model={model_name} "
+            f"input={input_file} output={output_file} pll_metric={pll_metric} layers={layers}"
+        )
         if not data:
             print(f"Warning: No valid data found in {input_file}")
             print("Please check that:")
@@ -397,7 +444,8 @@ def process_from_file(
             progress=True,
             pll_metric=pll_metric,
             layers=layers,
-            temperature=temperature
+            temperature=temperature,
+            logger=logger
         )
         write_output(
             output_file,
@@ -408,6 +456,8 @@ def process_from_file(
             top_k_cf_surprisal=top_k_cf_surprisal,
             output_format=output_format
         )
+        if 'logger' in locals():
+            logger.info(f"Completed run; wrote {len(results)} rows to {output_file}")
         print(f"Results written to: {output_file}")
     except FileNotFoundError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)

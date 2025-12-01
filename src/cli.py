@@ -44,6 +44,8 @@ Examples:
         help='Output format: tsv (default) or parquet')
     parser.add_argument('--temperature', type=float, default=1.0,
         help='Temperature scaling for surprisal/entropy (must be > 0)')
+    parser.add_argument('--log_file', default='',
+        help='Optional log file path. Defaults to <output_file>.log')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -114,7 +116,8 @@ Examples:
         layers=layers,
         top_k_cf_surprisal=args.top_k_cf_surprisal,
         output_format=args.output_format,
-        temperature=args.temperature
+        temperature=args.temperature,
+        log_file=args.log_file
     )
 
 if __name__ == "__main__":
