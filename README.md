@@ -12,6 +12,7 @@ You can also send the repo link to colleages and friends interested in computati
 * Can predict the n most probably next words, choice of greedy algorithm or beam search (will assemble next subtokens to reconstitute the word).
 * Handles accented characters.
 * Simple Command Line Interface, and scoring functions can easily be loaded from your own code.
+* Streams results per document to disk to reduce memory footprint and keep partial progress if a run stops.
 
 # Similar work
 * [minicons for python](https://github.com/kanishkamisra/minicons) also does AR and masked token models with PLL or L2R, but no entropy.

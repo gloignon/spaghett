@@ -253,17 +253,7 @@ def split_long_inputs(
 
 
 def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n: int, mode: str, top_k_cf_surprisal: bool = False, output_format: str = 'tsv'):
-    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special']
-    # Add surprisal/entropy columns if present
-    sample = results[0] if results else {}
-    if 'surprisal_bits' in sample and 'entropy_bits' in sample:
-        columns += ['surprisal_bits', 'entropy_bits']
-    # Add layered columns if present
-    layered_cols = [c for c in sample.keys() if c.startswith('layer')]
-    columns += sorted(layered_cols)
-    columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
-    if mode == 'ar':
-        columns += [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
+    columns = build_output_columns(infer_layers_from_sample(results), top_k, lookahead_n, mode)
     df = pd.DataFrame(results)
     # Only select columns that exist in the DataFrame
     columns = [c for c in columns if c in df.columns]
@@ -271,11 +261,125 @@ def write_output(output_file: str, results: List[dict], top_k: int, lookahead_n:
     if top_k_cf_surprisal:
         for i in range(1, top_k + 1):
             col = f'pred_alt_{i}'
-            df[col] = df[col].apply(lambda val: f'{val[0]}|{val[1]:.4f}' if isinstance(val, tuple) else val)
+            if col in df.columns:
+                df[col] = df[col].apply(format_pred_value)
     if output_format == 'parquet':
         df.to_parquet(output_file, index=False)
     else:
         df.to_csv(output_file, sep='\t', index=False)
+
+
+def infer_layers_from_sample(rows: List[dict]) -> Optional[List[int]]:
+    """Detect requested layers from a sample of result rows."""
+    if not rows:
+        return None
+    sample = rows[0]
+    layers = []
+    for key in sample.keys():
+        if key.startswith("layer") and key.endswith("_surprisal_bits"):
+            try:
+                layer_idx = int(key[len("layer") : -len("_surprisal_bits")])
+                layers.append(layer_idx)
+            except ValueError:
+                continue
+    return sorted(set(layers)) if layers else None
+
+
+def build_output_columns(layers: Optional[List[int]], top_k: int, lookahead_n: int, mode: str) -> List[str]:
+    """Construct output column order based on configuration."""
+    columns = ['doc_id', 'sentence_id', 'token_index', 'token', 'token_decoded', 'is_special']
+    if layers is None:
+        columns += ['surprisal_bits', 'entropy_bits']
+    else:
+        for layer_idx in sorted(set(layers)):
+            columns.append(f'layer{layer_idx}_surprisal_bits')
+            columns.append(f'layer{layer_idx}_entropy_bits')
+    columns += [f'pred_alt_{i}' for i in range(1, top_k + 1)]
+    if mode == 'ar':
+        columns += [f'pred_next_{i}' for i in range(1, lookahead_n + 1)]
+    return columns
+
+
+def format_pred_value(val):
+    """Format a prediction entry (token, cf_surprisal) to token|value string."""
+    if isinstance(val, tuple) and len(val) == 2:
+        return f'{val[0]}|{val[1]:.4f}'
+    return val
+
+
+class IncrementalWriter:
+    """
+    Incrementally write scoring rows to disk to limit memory usage.
+    Supports TSV and Parquet outputs.
+    """
+
+    def __init__(
+        self,
+        output_file: str,
+        mode: str,
+        layers: Optional[List[int]],
+        top_k: int,
+        lookahead_n: int,
+        top_k_cf_surprisal: bool = False,
+        output_format: str = 'tsv'
+    ):
+        self.output_file = output_file
+        self.output_format = output_format
+        self.top_k = top_k
+        self.lookahead_n = lookahead_n
+        self.mode = mode
+        self.top_k_cf_surprisal = top_k_cf_surprisal
+        self.columns = build_output_columns(layers, top_k, lookahead_n, mode)
+        self.total_rows = 0
+
+        self._csv_handle = None
+        self._csv_writer = None
+        self._parquet_writer = None
+        self._parquet = None
+
+        if output_format == 'tsv':
+            self._csv_handle = open(output_file, 'w', encoding='utf-8', newline='')
+            self._csv_writer = csv.DictWriter(self._csv_handle, fieldnames=self.columns, delimiter='\t', extrasaction='ignore')
+            self._csv_writer.writeheader()
+        elif output_format == 'parquet':
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                self._parquet = (pa, pq)
+            except Exception as e:
+                raise ImportError("pyarrow is required for incremental parquet writing") from e
+        else:
+            raise ValueError(f"Unsupported output format: {output_format}")
+
+    def write_rows(self, rows: List[dict]):
+        if not rows:
+            return
+        if self.top_k_cf_surprisal and self.top_k > 0:
+            for row in rows:
+                for i in range(1, self.top_k + 1):
+                    col = f'pred_alt_{i}'
+                    if col in row:
+                        row[col] = format_pred_value(row[col])
+        if self.output_format == 'tsv':
+            for row in rows:
+                self._csv_writer.writerow(row)
+        else:
+            pa, pq = self._parquet
+            df = pd.DataFrame(rows)
+            df = df.reindex(columns=self.columns, fill_value='')
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if self._parquet_writer is None:
+                self._parquet_writer = pq.ParquetWriter(self.output_file, table.schema)
+            self._parquet_writer.write_table(table)
+        self.total_rows += len(rows)
+
+    def close(self):
+        if self._csv_handle:
+            self._csv_handle.close()
+            self._csv_handle = None
+        if self._parquet_writer:
+            self._parquet_writer.close()
+            self._parquet_writer = None
 
 # ============================================================================
 # Core processing function (I/O independent)
@@ -296,7 +400,9 @@ def process_sentences(
     pll_metric: str = 'original',
     layers: Optional[List[int]] = None,
     temperature: float = 1.0,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    writer: Optional[IncrementalWriter] = None,
+    flush_by_doc: bool = False
 ) -> List[dict]:
     config = ScoringConfig(
         mode=mode,
@@ -367,12 +473,27 @@ def process_sentences(
             f"Error: {type(e).__name__}: {str(e)}"
         )
     model.eval()
-    results = []
+    results: List[dict] = [] if writer is None else None
+    current_doc = None
+    doc_buffer: List[dict] = []
+
+    def flush_buffer():
+        nonlocal doc_buffer
+        if writer and doc_buffer:
+            writer.write_rows(doc_buffer)
+            doc_buffer = []
+
     iterator = zip(doc_ids, sentence_ids, sentences)
     if progress:
         desc = "Processing"
         iterator = tqdm(iterator, total=len(sentences), desc=desc)
     for doc_id, sent_id, sentence in iterator:
+        if writer and flush_by_doc:
+            if current_doc is None:
+                current_doc = doc_id
+            elif doc_id != current_doc:
+                flush_buffer()
+                current_doc = doc_id
         if logger:
             logger.info(f"Scoring doc_id={doc_id} sentence_id={sent_id}")
         try:
@@ -396,18 +517,21 @@ def process_sentences(
                     'token_decoded': next(iter(result.values())).scored_tokens[idx],
                     'is_special': next(iter(result.values())).is_special_flags[idx]
                 }
-                for layer_idx, layer_result in result.items():
-                    row[f'layer{layer_idx}_surprisal_bits'] = '' if math.isnan(layer_result.surprisals[idx]) else f'{layer_result.surprisals[idx]:.4f}'
-                    row[f'layer{layer_idx}_entropy_bits'] = '' if math.isnan(layer_result.entropies[idx]) else f'{layer_result.entropies[idx]:.4f}'
-                # Use top_k preds from last layer only
-                last_layer = max(result.keys())
-                preds = result[last_layer].pred_columns[idx]
-                for i in range(1, top_k + 1):
-                    row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
-                if mode == 'ar':
-                    offset = top_k
-                    for i in range(1, lookahead_n + 1):
-                        row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+            for layer_idx, layer_result in sorted(result.items()):
+                row[f'layer{layer_idx}_surprisal_bits'] = '' if math.isnan(layer_result.surprisals[idx]) else f'{layer_result.surprisals[idx]:.4f}'
+                row[f'layer{layer_idx}_entropy_bits'] = '' if math.isnan(layer_result.entropies[idx]) else f'{layer_result.entropies[idx]:.4f}'
+            # Use top_k preds from last layer only
+            last_layer = max(result.keys())
+            preds = result[last_layer].pred_columns[idx]
+            for i in range(1, top_k + 1):
+                row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
+            if mode == 'ar':
+                offset = top_k
+                for i in range(1, lookahead_n + 1):
+                    row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+            if writer:
+                doc_buffer.append(row)
+            else:
                 results.append(row)
         else:
             raw_tokens = result.raw_tokens
@@ -435,8 +559,13 @@ def process_sentences(
                     offset = top_k
                     for i in range(1, lookahead_n + 1):
                         row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
-                results.append(row)
-    return results
+                if writer:
+                    doc_buffer.append(row)
+                else:
+                    results.append(row)
+
+    flush_buffer()
+    return results if results is not None else []
 
 # ============================================================================
 
@@ -499,6 +628,22 @@ def process_from_file(
         doc_ids = [item[0] for item in data]
         sentence_ids = [item[1] for item in data]
         sentences = [item[2] for item in data]
+        writer = None
+        try:
+            writer = IncrementalWriter(
+                output_file=output_file,
+                mode=mode,
+                layers=layers,
+                top_k=top_k,
+                lookahead_n=lookahead_n,
+                top_k_cf_surprisal=top_k_cf_surprisal,
+                output_format=output_format
+            )
+        except Exception as e:
+            if logger:
+                logger.warning("Falling back to batch write: %s", e)
+            writer = None
+
         results = process_sentences(
             sentences=sentences,
             mode=mode,
@@ -514,19 +659,27 @@ def process_from_file(
             pll_metric=pll_metric,
             layers=layers,
             temperature=temperature,
-            logger=logger
+            logger=logger,
+            writer=writer,
+            flush_by_doc=True
         )
-        write_output(
-            output_file,
-            results,
-            top_k,
-            lookahead_n,
-            mode,
-            top_k_cf_surprisal=top_k_cf_surprisal,
-            output_format=output_format
-        )
+        if writer:
+            writer.close()
+            rows_written = writer.total_rows
+        else:
+            write_output(
+                output_file,
+                results,
+                top_k,
+                lookahead_n,
+                mode,
+                top_k_cf_surprisal=top_k_cf_surprisal,
+                output_format=output_format
+            )
+            rows_written = len(results)
+
         if 'logger' in locals():
-            logger.info(f"Completed run; wrote {len(results)} rows to {output_file}")
+            logger.info(f"Completed run; wrote {rows_written} rows to {output_file}")
         print(f"Results written to: {output_file}")
     except FileNotFoundError as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
