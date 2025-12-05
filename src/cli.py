@@ -31,7 +31,7 @@ Examples:
     parser.add_argument('--max_sentence_words', type=int, default=0,
                        help='Split sentences longer than this many words (0 disables, default)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
-    parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
+    parser.add_argument('--top_k', type=int, default=0, help='Number of top-k predictions (default: 0)')
     parser.add_argument('--top_k_cf_surprisal', action='store_true',
         help='If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)')
     parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens (default: 3)')
@@ -85,7 +85,9 @@ Examples:
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
-    parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
+    parts = [Path(args.input_file).stem, args.mode, model_short]
+    if args.top_k > 0:
+        parts.append(f'k{args.top_k}')
     if args.left_context_file:
         parts.append('extra')
     if args.mode == 'ar' and args.lookahead_n > 0:

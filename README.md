@@ -40,7 +40,9 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 ```
 
 #### Required Arguments
-- `--input_file`: Path to input TSV file
+- `--input_file`: Path to input TSV file. Expected structure is either documents or sentences:
+  - Documents format: columns `doc_id` and `text`
+  - Sentences format: columns `doc_id`, `sentence_id` and `sentence`
 - `--mode`: Model type - `ar` (autoregressive/GPT-style) or `mlm` (masked/BERT-style)
 - `--model`: HuggingFace model name (e.g., `gpt2`, `bert-base-uncased`, `almanach/camembert-base`)
 

@@ -76,9 +76,7 @@ def setup_logger(log_file: Optional[str] = None, level: int = logging.INFO) -> l
         return logger
     logger.setLevel(level)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    # Only log to file, not to console, to avoid spamming console output
     if log_file:
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(formatter)
@@ -434,7 +432,7 @@ def process_sentences(
     mode: str,
     model_name: str,
     left_context: str = '',
-    top_k: int = 5,
+    top_k: int = 0,
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
@@ -542,6 +540,7 @@ def process_sentences(
             elif doc_id != current_doc:
                 flush_buffer()
                 current_doc = doc_id
+        # Only log to file, not to console, to avoid console spam
         if logger:
             logger.info(f"Scoring doc_id={doc_id} sentence_id={sent_id}")
         try:
@@ -565,22 +564,22 @@ def process_sentences(
                     'token_decoded': next(iter(result.values())).scored_tokens[idx],
                     'is_special': next(iter(result.values())).is_special_flags[idx]
                 }
-            for layer_idx, layer_result in sorted(result.items()):
-                row[f'layer{layer_idx}_surprisal_bits'] = '' if math.isnan(layer_result.surprisals[idx]) else f'{layer_result.surprisals[idx]:.4f}'
-                row[f'layer{layer_idx}_entropy_bits'] = '' if math.isnan(layer_result.entropies[idx]) else f'{layer_result.entropies[idx]:.4f}'
-            # Use top_k preds from last layer only
-            last_layer = max(result.keys())
-            preds = result[last_layer].pred_columns[idx]
-            for i in range(1, top_k + 1):
-                row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
-            if mode == 'ar':
-                offset = top_k
-                for i in range(1, lookahead_n + 1):
-                    row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
-            if writer:
-                doc_buffer.append(row)
-            else:
-                results.append(row)
+                for layer_idx, layer_result in sorted(result.items()):
+                    row[f'layer{layer_idx}_surprisal_bits'] = '' if math.isnan(layer_result.surprisals[idx]) else f'{layer_result.surprisals[idx]:.4f}'
+                    row[f'layer{layer_idx}_entropy_bits'] = '' if math.isnan(layer_result.entropies[idx]) else f'{layer_result.entropies[idx]:.4f}'
+                # Use top_k preds from last layer only
+                last_layer = max(result.keys())
+                preds = result[last_layer].pred_columns[idx]
+                for i in range(1, top_k + 1):
+                    row[f'pred_alt_{i}'] = preds[i - 1] if i - 1 < len(preds) else ''
+                if mode == 'ar':
+                    offset = top_k
+                    for i in range(1, lookahead_n + 1):
+                        row[f'pred_next_{i}'] = preds[offset + i - 1] if offset + i - 1 < len(preds) else ''
+                if writer:
+                    doc_buffer.append(row)
+                else:
+                    results.append(row)
         else:
             raw_tokens = result.raw_tokens
             tokens = result.scored_tokens
@@ -624,7 +623,7 @@ def process_from_file(
     model_name: str,
     format_type: str,
     left_context_file: str = '',
-    top_k: int = 5,
+    top_k: int = 0,
     lookahead_n: int = 3,
     lookahead_strategy: str = 'greedy',
     beam_width: int = 3,
