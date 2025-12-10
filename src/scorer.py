@@ -593,7 +593,8 @@ def score_masked_lm_by_layers(
     layers: Optional[List[int]] = None,
     top_k: int = 5,
     context_ids: List[int] = None,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    batch_size: int = 0
 ) -> dict:
     """
     Compute surprisal for specified layers in MLM model.
@@ -616,84 +617,92 @@ def score_masked_lm_by_layers(
     num_tokens = len(sentence_ids)
 
     masked_batch = []
+    variant_targets = []
     for sent_pos in range(num_tokens):
         combined_pos = sentence_start + sent_pos
         masked_ids = base_ids.clone()
         masked_ids[combined_pos] = tokenizer.mask_token_id
         masked_batch.append(masked_ids)
-
-    masked_batch = torch.stack(masked_batch)
-
-    with torch.no_grad():
-        outputs = model(masked_batch, output_hidden_states=True)
-        # all_logits = outputs.logits
-        hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
+        variant_targets.append((sent_pos, combined_pos))
 
     # If no layers specified, use last layer only
     if layers is None:
-        layers = [len(hidden_states) - 1]
+        layers = [model.config.num_hidden_layers]
+
+    def project_hidden_to_logits(hidden):
+        if hasattr(model, "cls"):
+            return model.cls(hidden)
+        if hasattr(model, "lm_head"):
+            return model.lm_head(hidden)
+        try:
+            out_emb = model.get_output_embeddings()
+        except Exception:
+            out_emb = None
+
+        if out_emb is not None:
+            if isinstance(out_emb, torch.nn.Linear):
+                return out_emb(hidden)
+            try:
+                emb_weight = out_emb.weight
+                return torch.matmul(hidden, emb_weight.t())
+            except Exception:
+                raise AttributeError("Unable to project hidden states via output embeddings")
+
+        try:
+            in_emb = model.get_input_embeddings()
+            emb_weight = in_emb.weight
+            return torch.matmul(hidden, emb_weight.t())
+        except Exception:
+            raise AttributeError("Model does not have a suitable output head (cls, lm_head) or usable embeddings")
 
     results = {}
+    layer_data = {}
     for layer_idx in layers:
-        # For MLM, project hidden states to logits for each layer
-        # Use model.cls (for BERT) or model.lm_head (for Camembert, etc.)
-        layer_hidden = hidden_states[layer_idx]  # shape: (batch, seq_len, hidden_dim)
-        if hasattr(model, "cls"):
-            layer_logits = model.cls(layer_hidden)
-        elif hasattr(model, "lm_head"):
-            layer_logits = model.lm_head(layer_hidden)
-        else:
-            # Try model.get_output_embeddings() (common HF API)
-            out_emb = None
-            try:
-                out_emb = model.get_output_embeddings()
-            except Exception:
-                out_emb = None
+        layer_data[layer_idx] = {
+            "surprisals": [float("nan")] * num_tokens,
+            "entropies": [float("nan")] * num_tokens,
+            "pred_columns": [[] for _ in range(num_tokens)],
+        }
 
-            if out_emb is not None:
-                # If it's a Linear layer (hidden_dim -> vocab_size)
-                if isinstance(out_emb, torch.nn.Linear):
-                    layer_logits = out_emb(layer_hidden)
-                else:
-                    # If embeddings (vocab_size x emb_dim), do matmul
-                    try:
-                        emb_weight = out_emb.weight
-                        layer_logits = torch.matmul(layer_hidden, emb_weight.t())
-                    except Exception:
-                        raise AttributeError("Unable to project hidden states via output embeddings")
-            else:
-                # Last resort: try input embeddings weight
-                try:
-                    in_emb = model.get_input_embeddings()
-                    emb_weight = in_emb.weight
-                    layer_logits = torch.matmul(layer_hidden, emb_weight.t())
-                except Exception:
-                    raise AttributeError("Model does not have a suitable output head (cls, lm_head) or usable embeddings")
+    raw_tokens, scored_tokens, is_special_flags = [], [], []
+    for sent_pos in range(num_tokens):
+        tid = int(sentence_ids[sent_pos].item())
+        is_special = 1 if special_mask[sent_pos] else 0
+        raw_token, token_str = decode_token(tokenizer, tid, is_special)
+        raw_tokens.append(raw_token)
+        scored_tokens.append(token_str)
+        is_special_flags.append(is_special)
 
-        raw_tokens, scored_tokens, is_special_flags = [], [], []
-        surprisals, entropies, pred_columns = [], [], []
+    total_variants = len(masked_batch)
+    chunk = batch_size if batch_size and batch_size > 0 else total_variants
 
-        for sent_pos in range(num_tokens):
-            combined_pos = sentence_start + sent_pos
-            target_id = sentence_ids[sent_pos].item()
-            is_special = 1 if special_mask[sent_pos] else 0
-            logits = layer_logits[sent_pos, combined_pos]
-            surprisal, entropy = compute_surprisal_entropy(logits, target_id, temperature)
-            top_k_preds = get_top_k_predictions(logits, tokenizer, top_k, temperature)
-            raw_token, token_str = decode_token(tokenizer, target_id, is_special)
-            raw_tokens.append(raw_token)
-            scored_tokens.append(token_str)
-            is_special_flags.append(is_special)
-            surprisals.append(surprisal)
-            entropies.append(entropy)
-            pred_columns.append(top_k_preds)
+    for start in range(0, total_variants, chunk):
+        end = start + chunk
+        batch = torch.stack(masked_batch[start:end])
+        with torch.no_grad():
+            outputs = model(batch, output_hidden_states=True)
+            hidden_states = outputs.hidden_states  # tuple: (layer0, ..., layerN)
 
+        for layer_idx in layers:
+            layer_hidden = hidden_states[layer_idx]  # shape: (batch, seq_len, hidden_dim)
+            layer_logits = project_hidden_to_logits(layer_hidden)
+            for local_idx, (sent_pos, combined_pos) in enumerate(variant_targets[start:end]):
+                target_id = sentence_ids[sent_pos].item()
+                logits = layer_logits[local_idx, combined_pos]
+                surp, ent = compute_surprisal_entropy(logits, target_id, temperature)
+                top_k_preds = get_top_k_predictions(logits, tokenizer, top_k, temperature)
+                layer_data[layer_idx]["surprisals"][sent_pos] = surp
+                layer_data[layer_idx]["entropies"][sent_pos] = ent
+                layer_data[layer_idx]["pred_columns"][sent_pos] = top_k_preds
+
+    for layer_idx in layers:
+        data = layer_data[layer_idx]
         results[layer_idx] = ScoringResult(
-            raw_tokens=raw_tokens,
-            scored_tokens=scored_tokens,
-            is_special_flags=is_special_flags,
-            surprisals=surprisals,
-            entropies=entropies,
-            pred_columns=pred_columns
+            raw_tokens=list(raw_tokens),
+            scored_tokens=list(scored_tokens),
+            is_special_flags=list(is_special_flags),
+            surprisals=data["surprisals"],
+            entropies=data["entropies"],
+            pred_columns=data["pred_columns"]
         )
     return results

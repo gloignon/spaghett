@@ -19,3 +19,6 @@ minicons>=0.3
 # If you want to output parquet files
 pyarrow
 pandas
+
+# If you want better sentence segmentation
+syntok>=1.4.4

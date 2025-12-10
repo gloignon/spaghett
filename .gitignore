@@ -4,3 +4,5 @@ src/__pycache__/
 test/output/
 out/
 test/__pycache__/
+in_private/
+out_private/

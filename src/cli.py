@@ -28,8 +28,10 @@ Examples:
                        help='HuggingFace model name (e.g., "gpt2", "bert-base-uncased")')
     parser.add_argument('--format', choices=['documents', 'sentences'], default="sentences",
                        help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
+    parser.add_argument('--max_sentence_words', type=int, default=0,
+                       help='Split sentences longer than this many words (0 disables, default)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
-    parser.add_argument('--top_k', type=int, default=3, help='Number of top-k predictions (default: 3)')
+    parser.add_argument('--top_k', type=int, default=0, help='Number of top-k predictions (default: 0)')
     parser.add_argument('--top_k_cf_surprisal', action='store_true',
         help='If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)')
     parser.add_argument('--lookahead_n', type=int, default=3, help='AR: number of lookahead tokens (default: 3)')
@@ -38,12 +40,18 @@ Examples:
     parser.add_argument('--beam_width', type=int, default=3, help='AR: beam width for beam search (default: 3)')
     parser.add_argument('--pll_metric', choices=['original', 'within_word_l2r'],
                         default='original', help='MLM: PLL variant - "original" or "within_word_l2r" (default: original)')
+    parser.add_argument('--mlm_batch_size', type=int, default=0,
+                        help='MLM: mini-batch size for per-token masks when scoring layers (0 = process all at once)')
     parser.add_argument('--layers', nargs='*', default=None,
         help='Optional: list of layer indices to compute surprisal from, e.g. [0,5,7] or all for all layers. Default: last layer only.')
     parser.add_argument('--output_format', choices=['tsv', 'parquet'], default='tsv',
         help='Output format: tsv (default) or parquet')
     parser.add_argument('--temperature', type=float, default=1.0,
         help='Temperature scaling for surprisal/entropy (must be > 0)')
+    parser.add_argument('--log_file', default='',
+        help='Optional log file path. Defaults to <output_file>.log')
+    parser.add_argument('--resume', action='store_true',
+        help='Resume from an existing output file: skip already-scored doc_ids and append new results')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -77,7 +85,9 @@ Examples:
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     model_short = args.model.replace('/', '_').split('-')[0]
-    parts = [Path(args.input_file).stem, args.mode, model_short, f'k{args.top_k}']
+    parts = [Path(args.input_file).stem, args.mode, model_short]
+    if args.top_k > 0:
+        parts.append(f'k{args.top_k}')
     if args.left_context_file:
         parts.append('extra')
     if args.mode == 'ar' and args.lookahead_n > 0:
@@ -115,7 +125,11 @@ Examples:
         layers=layers,
         top_k_cf_surprisal=args.top_k_cf_surprisal,
         output_format=args.output_format,
-        temperature=args.temperature
+        temperature=args.temperature,
+        log_file=args.log_file,
+        max_sentence_words=args.max_sentence_words,
+        resume=args.resume,
+        mlm_batch_size=args.mlm_batch_size
     )
 
 if __name__ == "__main__":

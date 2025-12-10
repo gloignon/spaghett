@@ -66,6 +66,68 @@ def test_mlm_layered_surprisal():
         assert all(isinstance(e, float) for e in res.entropies)
         assert all(e >= 0 or math.isnan(e) for e in res.entropies)
 
+def test_mlm_layered_surprisal_chunked_equals_full():
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+    sentence = "The cat sat on the mat."
+    layers = [0, 6, 11]
+    full = score_masked_lm_by_layers(
+        sentence=sentence,
+        tokenizer=tokenizer,
+        model=model,
+        layers=layers,
+        top_k=2,
+        batch_size=0  # process all at once
+    )
+    chunked = score_masked_lm_by_layers(
+        sentence=sentence,
+        tokenizer=tokenizer,
+        model=model,
+        layers=layers,
+        top_k=2,
+        batch_size=1  # force tiny mini-batches
+    )
+    assert set(full.keys()) == set(chunked.keys()) == set(layers)
+    for layer_idx in layers:
+        full_res = full[layer_idx]
+        chunk_res = chunked[layer_idx]
+        for a, b in zip(full_res.surprisals, chunk_res.surprisals):
+            if math.isnan(a):
+                assert math.isnan(b)
+            else:
+                assert math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+        for a, b in zip(full_res.entropies, chunk_res.entropies):
+            if math.isnan(a):
+                assert math.isnan(b)
+            else:
+                assert math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+
+
+def test_mlm_all_layers_long_sentence_chunked():
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+    long_sentence = " ".join(["The cat sat on the mat"] * 12)  # long enough to stress batching
+    num_layers = model.config.num_hidden_layers
+    layers = list(range(num_layers + 1))  # include embeddings layer
+    results = score_masked_lm_by_layers(
+        sentence=long_sentence,
+        tokenizer=tokenizer,
+        model=model,
+        layers=layers,
+        top_k=1,
+        batch_size=4  # force mini-batching for memory safety
+    )
+    assert set(results.keys()) == set(layers)
+    seq_len = len(results[layers[-1]].surprisals)
+    assert seq_len > 30  # ensure the sentence is indeed long
+    for layer_idx, res in results.items():
+        assert len(res.surprisals) == seq_len
+        assert len(res.entropies) == seq_len
+        assert all(isinstance(s, float) for s in res.surprisals)
+        assert all(isinstance(e, float) for e in res.entropies)
+
 def test_ar_all_layers():
     model_name = "gpt2"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
