@@ -2,6 +2,16 @@ doc_id	sentence_id	sentence
 demo1	1	The cats chased the mice.
 demo1	2	The cats chased the thunder.
 demo1	3	The ctas chased the mice.
-demo2	1	The cats chased the mise.
+demo1	4	The cats chased the mise.
+demo2	1	The cat chased the mouse.
+demo2	2	The cat chased the thunder.
+demo2	3	The cta chased the mouse.
+demo2	4	The cat chased the mouses.
+demo2	5	The kitten chased the mouse.
+demo2	6	The cat chased the rodent.
+demo2	7	The cat chassed the mouse.
+demo2	8	The feline chased the mouse.
+demo2	9	The mouse chased the cat.
+demo2	10	The cat chasde the mouse.
 
 
