@@ -1,0 +1,8 @@
+doc_id	sentence_id	sentence
+test1	1	Short.
+test1	2	Also short.
+test1	3	This is a much longer sentence with many words.
+test1	4	Tiny.
+test1	5	Another longer sentence that should not be combined.
+test2	1	Small.
+test2	2	Different doc.

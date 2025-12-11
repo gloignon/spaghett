@@ -69,6 +69,7 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 - `--output_format`: Output format, either `tsv` (default) or `parquet`
 - `--format`: Input format - `documents` or `sentences` (default: `sentences`)
 - `--max_sentence_words`: Split sentences longer than this many whitespace-separated words before scoring (default: disabled)
+- `--min_sentence_words`: Combine sentences shorter than this many whitespace-separated words with the next sentence (default: disabled). Sentences are only combined within the same document, and sentence IDs are joined with `+` (e.g., `1+2`)
 - `--left_context_file`: Path to text file for left context (prepended to each sentence)
 - `--top_k`: Number of top predictions to output (default: `3`, use `0` to disable)
 - `--top_k_cf_surprisal`: If set, output counterfactual surprisal for each top-k prediction (pred_alt columns will be token|surprisal)
@@ -117,6 +118,12 @@ python src/cli.py --input_file data.tsv --mode ar --model gpt2 --layers 0 5 11
 ```bash
 python src/cli.py --input_file data.tsv --mode ar --model gpt2 --lookahead_n 5 --lookahead_strategy beam --beam_width 3
 ```
+
+**Combine short sentences (useful for handling sentence fragments):**
+```bash
+python src/cli.py --input_file data.tsv --mode ar --model gpt2 --min_sentence_words 5
+```
+This will combine any sentence with fewer than 5 words with the next sentence in the same document.
 
 
 #### Main Results File

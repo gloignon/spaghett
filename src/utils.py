@@ -260,6 +260,60 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
     return data
 
 
+def combine_short_sentences(
+    rows: List[Tuple[str, str, str]],
+    min_sentence_words: int = 0,
+    logger: Optional[logging.Logger] = None
+) -> Tuple[List[Tuple[str, str, str]], dict]:
+    """
+    Combine sentences shorter than min_sentence_words with the next sentence.
+    Sentences are combined within the same doc_id only.
+
+    Returns:
+        (combined_rows, stats)
+        stats = {"combined_sentences": int, "total_units": int}
+    """
+    if min_sentence_words <= 0:
+        return rows, {"combined_sentences": 0, "total_units": len(rows)}
+
+    combined: List[Tuple[str, str, str]] = []
+    combine_count = 0
+    i = 0
+    
+    while i < len(rows):
+        doc_id, sent_id, sentence = rows[i]
+        word_count = len(sentence.split())
+        
+        # If sentence is too short and not the last sentence, try to combine
+        if word_count < min_sentence_words and i + 1 < len(rows):
+            # Check if next sentence is in the same document
+            next_doc_id = rows[i + 1][0]
+            if doc_id == next_doc_id:
+                # Combine with next sentence
+                next_sent_id = rows[i + 1][1]
+                next_sentence = rows[i + 1][2]
+                combined_sentence = sentence + " " + next_sentence
+                combined_sent_id = f"{sent_id}+{next_sent_id}"
+                combined.append((doc_id, combined_sent_id, combined_sentence))
+                combine_count += 1
+                i += 2  # Skip the next sentence as it's now combined
+                continue
+        
+        # Keep sentence as is
+        combined.append((doc_id, sent_id, sentence))
+        i += 1
+
+    stats = {"combined_sentences": combine_count, "total_units": len(combined)}
+    if logger and combine_count:
+        logger.info(
+            "Combined %s short sentence(s) (min_words=%s), resulting in %s unit(s)",
+            combine_count,
+            min_sentence_words,
+            stats["total_units"]
+        )
+    return combined, stats
+
+
 def split_long_inputs(
     rows: List[Tuple[str, str, str]],
     max_sentence_words: int = 0,
@@ -681,6 +735,7 @@ def process_from_file(
     temperature: float = 1.0,
     log_file: str = '',
     max_sentence_words: int = 0,
+    min_sentence_words: int = 0,
     resume: bool = False,
     mlm_batch_size: int = 0
 ):
@@ -708,11 +763,13 @@ def process_from_file(
         # Print the log file path so users (and tests) see where logs are written
         print(f"Logging to: {log_path}")
         logger = setup_logger(log_path)
+        # First combine short sentences, then split long ones
+        data, _combine_stats = combine_short_sentences(data, min_sentence_words, logger)
         data, _split_stats = split_long_inputs(data, max_sentence_words, logger)
         logger.info(
             f"Starting run | mode={mode} model={model_name} "
             f"input={input_file} output={output_file} pll_metric={pll_metric} layers={layers} "
-            f"max_sentence_words={max_sentence_words} sentences={len(data)}"
+            f"max_sentence_words={max_sentence_words} min_sentence_words={min_sentence_words} sentences={len(data)}"
         )
         if not data:
             print(f"Warning: No valid data found in {input_file}")

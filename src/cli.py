@@ -30,6 +30,8 @@ Examples:
                        help='Input format: "documents" (doc_id, text) or "sentences" (doc_id, sent_id, sentence)')
     parser.add_argument('--max_sentence_words', type=int, default=0,
                        help='Split sentences longer than this many words (0 disables, default)')
+    parser.add_argument('--min_sentence_words', type=int, default=0,
+                       help='Combine sentences shorter than this many words with the next sentence (0 disables, default)')
     parser.add_argument('--left_context_file', default='', help='File with left context (optional)')
     parser.add_argument('--top_k', type=int, default=0, help='Number of top-k predictions (default: 0)')
     parser.add_argument('--top_k_cf_surprisal', action='store_true',
@@ -128,6 +130,7 @@ Examples:
         temperature=args.temperature,
         log_file=args.log_file,
         max_sentence_words=args.max_sentence_words,
+        min_sentence_words=args.min_sentence_words,
         resume=args.resume,
         mlm_batch_size=args.mlm_batch_size
     )
