@@ -150,14 +150,18 @@ def read_left_context(path: str) -> str:
         )
 
 def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, str]]:
-    """Load input TSV and return list of (doc_id, sentence_id, sentence)."""
+    """Load input TSV and return list of (doc_id, sentence_id, sentence).
+    
+    Extra columns in the input file are ignored. Required columns can appear
+    in any order and position. For sentences format, both 'sentence' and 'text'
+    column names are accepted for the sentence data.
+    """
     if not os.path.exists(input_file):
         raise FileNotFoundError(
             f"Input file not found: '{input_file}'\n"
             f"Please check that the file path is correct and the file exists."
         )
-    required_cols = ['doc_id', 'text'] if format_type == 'documents' else ['doc_id', 'sentence_id', 'sentence']
-    min_cols = len(required_cols)
+    
     data = []
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
@@ -167,44 +171,87 @@ def load_input_data(input_file: str, format_type: str) -> List[Tuple[str, str, s
             except StopIteration:
                 raise ValueError(
                     f"Input file is empty: '{input_file}'\n"
-                    f"Expected format: {chr(9).join(required_cols)}"
+                    f"Expected columns: doc_id, " + ("text" if format_type == 'documents' else "sentence_id, sentence (or text)")
                 )
-            if len(header) < min_cols:
-                raise ValueError(
-                    f"Invalid header in '{input_file}'\n"
-                    f"Expected {min_cols} columns: {', '.join(required_cols)}\n"
-                    f"Got {len(header)}: {', '.join(header) if header else '(empty)'}"
-                )
-            header_lower = [col.lower().strip() for col in header[:min_cols]]
-            if header_lower != required_cols:
-                print(f"Warning: Expected columns {required_cols}, got {header[:min_cols]}")
+            
+            # Create case-insensitive mapping of column names to indices
+            header_lower = {col.lower().strip(): idx for idx, col in enumerate(header)}
+            
+            # Find required columns
+            if format_type == 'documents':
+                required_cols = {'doc_id': None, 'text': None}
+                if 'doc_id' not in header_lower:
+                    raise ValueError(
+                        f"Missing required column 'doc_id' in '{input_file}'\n"
+                        f"Available columns: {', '.join(header)}"
+                    )
+                if 'text' not in header_lower:
+                    raise ValueError(
+                        f"Missing required column 'text' in '{input_file}'\n"
+                        f"Available columns: {', '.join(header)}"
+                    )
+                doc_id_idx = header_lower['doc_id']
+                text_idx = header_lower['text']
+            else:
+                # Sentences format: need doc_id, sentence_id, and sentence (or text)
+                if 'doc_id' not in header_lower:
+                    raise ValueError(
+                        f"Missing required column 'doc_id' in '{input_file}'\n"
+                        f"Available columns: {', '.join(header)}"
+                    )
+                if 'sentence_id' not in header_lower:
+                    raise ValueError(
+                        f"Missing required column 'sentence_id' in '{input_file}'\n"
+                        f"Available columns: {', '.join(header)}"
+                    )
+                # Accept either 'sentence' or 'text' for the sentence content
+                sentence_idx = None
+                if 'sentence' in header_lower:
+                    sentence_idx = header_lower['sentence']
+                elif 'text' in header_lower:
+                    sentence_idx = header_lower['text']
+                else:
+                    raise ValueError(
+                        f"Missing required column 'sentence' or 'text' in '{input_file}'\n"
+                        f"Available columns: {', '.join(header)}"
+                    )
+                doc_id_idx = header_lower['doc_id']
+                sent_id_idx = header_lower['sentence_id']
+            
             row_count = 0
             for row_num, row in enumerate(reader, start=2):
                 if not row or all(cell.strip() == '' for cell in row):
                     continue
                 row_count += 1
-                if len(row) < min_cols:
-                    print(f"Warning: Skipping row {row_num}: expected {min_cols} columns, got {len(row)}")
+                
+                # Check if row has enough columns
+                max_idx = max(doc_id_idx, text_idx if format_type == 'documents' else max(sent_id_idx, sentence_idx))
+                if len(row) <= max_idx:
+                    print(f"Warning: Skipping row {row_num}: not enough columns")
                     continue
+                
                 if format_type == 'documents':
-                    doc_id, text = row[0].strip(), row[1].strip()
+                    doc_id = row[doc_id_idx].strip()
+                    text = row[text_idx].strip()
                     if not doc_id or not text:
                         print(f"Warning: Skipping row {row_num}: empty field(s)")
                         continue
                     sentences = simple_sentence_split(text)
                     data.extend((doc_id, str(i), s) for i, s in enumerate(sentences, 1))
                 else:
-                    doc_id, sent_id, sentence = row[0].strip(), row[1].strip(), row[2].strip()
+                    doc_id = row[doc_id_idx].strip()
+                    sent_id = row[sent_id_idx].strip()
+                    sentence = row[sentence_idx].strip()
                     if not (doc_id and sent_id and sentence):
                         print(f"Warning: Skipping row {row_num}: empty field(s)")
                         continue
                     data.append((doc_id, sent_id, sentence))
+            
             if row_count == 0:
                 raise ValueError(f"No data rows in '{input_file}'")
             if not data:
                 raise ValueError(
-                    f"No valid data in '{input_file}' ({row_count} rows were malformed)\n"
-                    f"Expected format: {chr(9).join(required_cols)}"
+                    f"No valid data in '{input_file}' ({row_count} rows were malformed)"
                 )
     except PermissionError:
         raise PermissionError(f"Permission denied: '{input_file}'")

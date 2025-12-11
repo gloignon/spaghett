@@ -43,8 +43,9 @@ pip install -r requirements.txt
 
 ## How to use
 
-Input is a .tsv file. Expected columns are doc_id and text (in documents mode), or doc_id, sentence_id and sentence (in sentences mode). 
-The first row is expected to be the column headers.
+Input is a .tsv file. Expected columns are `doc_id` and `text` (in documents mode), or `doc_id`, `sentence_id` and `sentence` (in sentences mode). 
+The first row is expected to be the column headers. Extra columns in your input file are ignored, and required columns can appear in any order. 
+For sentences mode, both `sentence` and `text` are accepted as valid column names for the sentence content.
 
 ### Command Line Interface
 
@@ -55,7 +56,8 @@ python src/cli.py --input_file <file> --mode <ar|mlm> --model <model_name> [opti
 #### Required Arguments
 - `--input_file`: Path to input TSV file. Expected structure is either documents or sentences:
   - Documents format: columns `doc_id` and `text`
-  - Sentences format: columns `doc_id`, `sentence_id` and `sentence`
+  - Sentences format: columns `doc_id`, `sentence_id` and `sentence` (or `text`)
+  - Extra columns are ignored; required columns can appear in any order
 - `--mode`: Model type - `ar` (autoregressive/GPT-style) or `mlm` (masked/BERT-style)
 - `--model`: HuggingFace model name (e.g., `gpt2`, `bert-base-uncased`, `almanach/camembert-base`)
 
